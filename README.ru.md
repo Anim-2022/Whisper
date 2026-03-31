@@ -8,7 +8,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Windows-0078d7?logo=windows)](https://www.microsoft.com/)
 
-[🇷🇺 Русский](#) · [🇬🇧 English](README.md)
+[🇺🇦 Українська](README.uk.md) · [🇷🇺 Русский](#) · [🇬🇧 English](README.md)
 
 </div>
 
