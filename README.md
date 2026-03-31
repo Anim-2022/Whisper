@@ -115,6 +115,96 @@ Whisper/
 
 ---
 
+## 🏗 Architecture & Logic
+
+### Pipeline Overview
+
+```mermaid
+graph TD
+    A["User"] -->|"Settings"| B("Whisper GUI")
+    B -->|"Config"| C["WhisperCore"]
+    
+    subgraph step1 ["1. Prep"]
+        C --> D["Load Audio<br/>(soundfile)"]
+        D --> E["Remove<br/>DC Offset"]
+        E --> F["Loudness<br/>Normalization"]
+        F --> G["Resample<br/>to 16 kHz"]
+    end
+    
+    subgraph step2 ["2. Segmentation"]
+        G --> H{"VAD Found?"}
+        H -->|"Yes"| I["Silero VAD<br/>finds speech"]
+        H -->|"No"| J["Sliding<br/>Window"]
+        I --> K["Merge<br/>small segments"]
+        J --> K
+        K --> L["Split<br/>long parts"]
+    end
+    
+    subgraph step3 ["3. Inference"]
+        L --> M["Build<br/>Batches"]
+        M --> N["Whisper<br/>Processor"]
+        N --> O["Token<br/>Generation"]
+        
+        O -->|"OOM Error"| P["Clear<br/>GPU Cache"]
+        P --> Q["Split<br/>into 2 parts"]
+        Q --> O
+        
+        O -->|"Success"| R["Decode<br/>into text"]
+    end
+    
+    subgraph step4 ["4. Finalization"]
+        R --> S{"Boundary<br/>check"}
+        S -->|"Complex"| T["Fuzzy / Word<br/>overlap"]
+        S -->|"Sentence end"| U["Standard<br/>join"]
+        T --> V
+        U --> V
+        V["Write<br/>txt and srt"]
+    end
+    
+    V --> A
+```
+
+### Segmentation Comparison
+
+| Feature | 🚀 Silero VAD (Recommended) | 🪟 Sliding Window (Fallback) |
+| :--- | :--- | :--- |
+| **Method** | Neural network detects voice and extracts only speech segments | Strict mathematical chunking (e.g. 20s each) |
+| **Silence handling** | Ignored, which saves VRAM and time | Passed to Whisper, risk of model hallucinations |
+| **Boundary stitching**| Rarely needed, since phrases are extracted intact | Requires Overlap to avoid cutting words in half |
+| **Timestamp accuracy**| Highest: `.srt` line starts precisely with voice | Average: tied to strict chunk boundaries |
+| **Resource usage**| Adaptive (depends on the actual sentence length) | Strictly fixed by chunk size |
+
+### Out-of-Memory (OOM) Safe-Fallback
+
+Implemented via recursive `transcribe_chunk_safe()`.
+
+```mermaid
+sequenceDiagram
+    participant Core as WhisperCore
+    participant GPU as GPU (VRAM)
+    
+    Core->>GPU: Send large audio chunk
+    
+    alt Enough Memory
+        GPU-->>Core: Return text
+    else RuntimeError (OOM)
+        GPU--xCore: Out Of Memory Error
+        Note over Core: VRAM Fallback
+        Core->>GPU: torch.cuda.empty_cache()
+        Core->>Core: Split audio in half
+        
+        Core->>GPU: Process Left Half
+        GPU-->>Core: Text Left
+        
+        Core->>GPU: Process Right Half
+        GPU-->>Core: Text Right
+        
+        Core->>Core: Intelligent stitching
+    end
+```
+
+---
+
 ## 🎛️ Presets
 
 | Preset | Best for |
