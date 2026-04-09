@@ -57,3 +57,8 @@ dist/
 build/
 *.egg-info/
 *.egg
+
+# --- AI Rules / Agent Context ---
+.cursorrules
+AI_AGENT_RULES.md
+OPTIMIZATIONS.md

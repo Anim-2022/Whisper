@@ -112,6 +112,10 @@ class WhisperCore:
         self.supports_attention_mask = True
         
         self.current_config = None
+        
+        # Internal cache for faster subsequent loads or checks
+        self._cache_model_path = {}
+        self._cache_vad_path = None
 
     def models_root(self) -> Path:
         return Path(__file__).parent / "models"
@@ -126,8 +130,12 @@ class WhisperCore:
         ]
 
     def resolve_local_model_path(self, model_path: str) -> Path:
+        if model_path in self._cache_model_path:
+            return self._cache_model_path[model_path]
+
         raw_path = Path(model_path)
         if raw_path.exists():
+            self._cache_model_path[model_path] = raw_path
             return raw_path
 
         cache_dir = self.models_root() / f"models--{model_path.replace('/', '--')}"
@@ -144,7 +152,9 @@ class WhisperCore:
         if snapshots_dir.exists():
             snapshot_dirs = [path for path in snapshots_dir.iterdir() if path.is_dir()]
             if snapshot_dirs:
-                return max(snapshot_dirs, key=lambda path: path.stat().st_mtime)
+                res = max(snapshot_dirs, key=lambda path: path.stat().st_mtime)
+                self._cache_model_path[model_path] = res
+                return res
 
         raise FileNotFoundError(
             f"Model '{model_path}' was not found locally. Choose a local model from the GUI "
@@ -152,22 +162,36 @@ class WhisperCore:
         )
 
     def resolve_local_vad_repo(self) -> Optional[Path]:
+        if self._cache_vad_path and self._cache_vad_path.exists():
+            return self._cache_vad_path
+
         for candidate in self.vad_repo_hints():
             if (candidate / "hubconf.py").exists():
+                self._cache_vad_path = candidate
                 return candidate
 
         models_root = self.models_root()
-        recursive_hits = sorted(
-            path.parent
-            for path in models_root.rglob("hubconf.py")
-            if "silero-vad" in str(path.parent).lower()
-        )
-        if recursive_hits:
-            return recursive_hits[0]
+        # Optimization: Don't use rglob on models_root as it scans everything.
+        # Just look into suspected sub-directories.
+        search_dirs = [models_root, models_root / "repos", models_root / "checkpoints"]
+        for sd in search_dirs:
+            if not sd.exists(): continue
+            for entry in sd.iterdir():
+                if entry.is_dir() and "silero-vad" in entry.name.lower():
+                    if (entry / "hubconf.py").exists():
+                        self._cache_vad_path = entry
+                        return entry
 
+        # Further fallback: if we really have to search, look for hubconf.py in a shallower way.
+        # Actually torch.hub.load usually expects it at the top or one level deep.
         hub_dir = Path(torch.hub.get_dir())
-        cache_hits = sorted(path for path in hub_dir.glob("*silero-vad*") if (path / "hubconf.py").exists())
-        return cache_hits[-1] if cache_hits else None
+        if hub_dir.exists():
+            cache_hits = sorted(path for path in hub_dir.glob("*silero-vad*") if (path / "hubconf.py").exists())
+            if cache_hits:
+                self._cache_vad_path = cache_hits[-1]
+                return self._cache_vad_path
+        
+        return None
 
     def log(self, msg: str):
         if self.on_log:
@@ -194,27 +218,55 @@ class WhisperCore:
         try:
             resolved_model_path = self.resolve_local_model_path(config.model_path)
             self.log(f"Resolved local model path: {resolved_model_path}")
+            
+            self.log("Step 1/2: Loading processor...")
             self.processor = WhisperProcessor.from_pretrained(
                 str(resolved_model_path),
                 local_files_only=True,
             )
+            
+            self.log("Step 2/2: Loading weights (this may take a moment)...")
+            
+            # Check for accelerate for better loading
+            has_accelerate = False
+            try:
+                import accelerate
+                has_accelerate = True
+            except ImportError:
+                pass
+
+            load_kwargs = {
+                "torch_dtype": config.torch_dtype,
+                "low_cpu_mem_usage": True,
+                "local_files_only": True,
+            }
+            if has_accelerate and config.device != "cpu":
+                load_kwargs["device_map"] = "auto"
+
             self.model = WhisperForConditionalGeneration.from_pretrained(
                 str(resolved_model_path),
-                torch_dtype=config.torch_dtype,
-                low_cpu_mem_usage=True,
-                local_files_only=True,
-            ).to(config.device)
+                **load_kwargs
+            )
+            
+            # If not using device_map, manually move to device
+            if "device_map" not in load_kwargs:
+                self.log(f"Moving model to {config.device}...")
+                self.model = self.model.to(config.device)
+                
             self.model.eval()
-            self.log("Model loaded successfully.")
+            self.log("Model loading complete.")
         except Exception as e:
             self.log(f"Error loading model: {e}")
             raise
     
-    def load_vad_model(self):
+    def load_vad_model(self, device: str = "cpu"):
         if self.vad_model is not None:
+            # If already loaded on different device, move it
+            if str(self.vad_model.device) != device and device != "cpu":
+                self.vad_model.to(device)
             return
             
-        self.log("Loading Silero VAD model...")
+        self.log(f"Loading Silero VAD model to {device}...")
         try:
             local_vad_repo = self.resolve_local_vad_repo()
             if local_vad_repo is None:
@@ -235,8 +287,10 @@ class WhisperCore:
                 force_reload=False,
                 onnx=False,
             )
+            if device != "cpu":
+                self.vad_model.to(device)
             self.vad_utils = utils
-            self.log("Silero VAD loaded.")
+            self.log(f"Silero VAD loaded on {device}.")
         except Exception as e:
             self.log(f"Error loading VAD: {e}")
             self.vad_model = None
@@ -300,7 +354,7 @@ class WhisperCore:
     # -------------------------------------------------------------------------
     def get_speech_timestamps(self, audio: np.ndarray, sr: int, config: TranscriptionConfig) -> List[Tuple[int, int]]:
         if not self.vad_model:
-            self.load_vad_model()
+            self.load_vad_model(device=config.device)
             
         if not self.vad_model or not self.vad_utils:
             self.log("VAD unavailable, skipping.")
@@ -310,17 +364,19 @@ class WhisperCore:
         
         # Silero expects tensor
         try:
-            tensor_wav = torch.from_numpy(audio).float()
+            device = next(self.vad_model.parameters()).device
+            tensor_wav = torch.from_numpy(audio).float().to(device)
             
             # get_speech_timestamps returns list of dicts: [{'start': int, 'end': int}, ...]
-            timestamps = get_speech_ts(
-                tensor_wav, 
-                self.vad_model, 
-                threshold=config.vad_threshold,
-                sampling_rate=sr,
-                min_speech_duration_ms=config.vad_min_speech_ms,
-                min_silence_duration_ms=config.vad_min_silence_ms
-            )
+            with torch.inference_mode():
+                timestamps = get_speech_ts(
+                    tensor_wav, 
+                    self.vad_model, 
+                    threshold=config.vad_threshold,
+                    sampling_rate=sr,
+                    min_speech_duration_ms=config.vad_min_speech_ms,
+                    min_silence_duration_ms=config.vad_min_silence_ms
+                )
             
             # Convert to list of tuples
             segments = [(ts['start'], ts['end']) for ts in timestamps]
@@ -334,6 +390,7 @@ class WhisperCore:
             merge_gap_samples = int(config.vad_merge_gap_sec * sr)
             return self.merge_segments(final, merge_gap_samples)
             
+            
         except Exception as e:
             self.log(f"VAD Execution error: {e}")
             return []
@@ -342,10 +399,16 @@ class WhisperCore:
         # 1. Try VAD
         segments = []
         if config.use_vad:
-            self.log("Running VAD (Silero)...")
+            if self.stop_requested:
+                return []
+            self.log(f"Running VAD (Silero) on {config.device}...")
+            start_time = time.time()
             segments = self.get_speech_timestamps(audio, sr, config)
+            if self.stop_requested:
+                return []
+            duration = time.time() - start_time
             total_duration = sum((e - s) for s, e in segments) / sr
-            self.log(f"VAD found {len(segments)} segments. Total speech duration: {total_duration:.2f}s")
+            self.log(f"VAD found {len(segments)} segments took {duration:.2f}s. Total speech duration: {total_duration:.2f}s")
         
         # 2. Fallback to sliding window
         if not segments:
@@ -401,20 +464,27 @@ class WhisperCore:
         if not a: return b
         if not b: return a
         
-        # Check punctuation sentence boundary
-        if a.rstrip().endswith(('.', '!', '?', '。', '！', '？')):
-            return a.rstrip() + " " + b.lstrip()
-            
+        # Word overlap detection
         aw = a.split()
         bw = b.split()
         max_k = min(len(aw), len(bw), max_overlap_words)
         
-        # Word overlap
         for k in range(max_k, 0, -1):
             aw_end = [w.lower().strip('.,!?;:') for w in aw[-k:]]
             bw_start = [w.lower().strip('.,!?;:') for w in bw[:k]]
             if aw_end == bw_start:
                 return a + " " + " ".join(bw[k:])
+
+        # If a ends with punctuation, we still check for substantial word overlap 
+        # because Whisper might repeat a whole sentence in the next chunk.
+        if a.rstrip().endswith(('.', '!', '?', '。', '！', '？')):
+            # If last 3 words of A are same as first 3 words of B, it's likely a repeat
+            if len(aw) >= 3 and len(bw) >= 3:
+                if [w.lower().strip('.,!?;:') for w in aw[-3:]] == [w.lower().strip('.,!?;:') for w in bw[:3]]:
+                    # Use fuzzy matcher to find exact cut point
+                    pass # Continue to fuzzy logic below
+            else:
+                return a.rstrip() + " " + b.lstrip()
 
         left_edge = a[-500:] if len(a) > 500 else a
         right_edge = b[:500] if len(b) > 500 else b
@@ -458,9 +528,12 @@ class WhisperCore:
             "max_new_tokens": config.max_new_tokens,
             "temperature": 0.0,
             "do_sample": False,
+            "repetition_penalty": 1.1,
+            "no_repeat_ngram_size": 5,
         }
         if config.decode_profile == "quality":
             decode_kwargs["num_beams"] = 5
+            decode_kwargs["early_stopping"] = True
 
         with torch.inference_mode():
             try:
@@ -538,6 +611,9 @@ class WhisperCore:
 
                 # Prepare Segments
                 segments = self.prepare_segments(audio, sr, config)
+                if self.stop_requested:
+                    self.log("Stopped by user.")
+                    break
                 chunks = [audio[s:e] for s, e in segments]
                 
                 # Transcribe
@@ -554,6 +630,14 @@ class WhisperCore:
                     
                     batch = chunks[i : i + bs]
                     
+                    # Pre-filter extremely quiet chunks to avoid hallucinations
+                    valid_batch = []
+                    valid_indices = []
+                    for idx_b, chunk in enumerate(batch):
+                        if np.max(np.abs(chunk)) > 0.005: 
+                            valid_batch.append(chunk)
+                            valid_indices.append(idx_b)
+                    
                     # File-level progress
                     file_percent = min(1.0, (i + len(batch)) / total_chunks)
                     overall_percent = (idx + file_percent) / overall_total
@@ -561,7 +645,16 @@ class WhisperCore:
                     self.update_progress(overall_percent, f"Обработка: {pct}%")
                     
                     try:
-                        texts = self._run_model(batch, sr, config)
+                        if valid_batch:
+                            texts = self._run_model(valid_batch, sr, config)
+                            # Map results back to full batch size with empty strings for skipped
+                            full_texts = [""] * len(batch)
+                            for v_idx, text in zip(valid_indices, texts):
+                                full_texts[v_idx] = text
+                            texts = full_texts
+                        else:
+                            texts = [""] * len(batch)
+                            
                         all_texts.extend(texts)
                         # Log preview for debug
                         if texts and texts[0].strip():
@@ -636,6 +729,8 @@ class WhisperCore:
                 import traceback
                 self.log(traceback.format_exc())
         
-        self.update_progress(1.0, "Done.")
-        if not self.stop_requested:
+        if self.stop_requested:
+            self.update_progress(0.0, "Stopped")
+        else:
+            self.update_progress(1.0, "Done.")
             self.log("All tasks completed.")
