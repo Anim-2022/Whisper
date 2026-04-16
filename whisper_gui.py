@@ -997,7 +997,7 @@ class WhisperGUI(ctk.CTk):
         self.max_new_tokens_label.grid(row=25, column=0, sticky="w", padx=20, pady=5)
         self.entry_max_tokens = ctk.CTkEntry(t, height=34)
         self.entry_max_tokens.grid(row=25, column=1, sticky="ew", padx=10, pady=5)
-        self.entry_max_tokens.insert(0, "225")
+        self.entry_max_tokens.insert(0, "128")
         self.add_help_text(
             t,
             26,
@@ -1107,7 +1107,7 @@ class WhisperGUI(ctk.CTk):
             self.set_entry_value(self.entry_vad_silence, 100)
             self.set_entry_value(self.entry_chunk_sec, 12.0)
             self.set_entry_value(self.entry_overlap_sec, 1.5)
-            self.set_entry_value(self.entry_max_tokens, 160)
+            self.set_entry_value(self.entry_max_tokens, 128)
             set_vad_enabled(True)
             self.slider_vad.set(0.5)
             self.update_vad_label(0.5)
@@ -1123,7 +1123,7 @@ class WhisperGUI(ctk.CTk):
             self.set_entry_value(self.entry_vad_silence, 140)
             self.set_entry_value(self.entry_chunk_sec, 20.0)
             self.set_entry_value(self.entry_overlap_sec, 3.0)
-            self.set_entry_value(self.entry_max_tokens, 225)
+            self.set_entry_value(self.entry_max_tokens, 160)
             set_vad_enabled(True)
             self.slider_vad.set(0.45)
             self.update_vad_label(0.45)
@@ -1139,7 +1139,7 @@ class WhisperGUI(ctk.CTk):
             self.set_entry_value(self.entry_vad_silence, 250)
             self.set_entry_value(self.entry_chunk_sec, 22.0)
             self.set_entry_value(self.entry_overlap_sec, 3.0)
-            self.set_entry_value(self.entry_max_tokens, 225)
+            self.set_entry_value(self.entry_max_tokens, 192)
             set_vad_enabled(True)
             self.slider_vad.set(0.35)
             self.update_vad_label(0.35)

@@ -5,7 +5,7 @@ echo Starting Whisper Unified GUI...
 echo Using Virtual Environment...
 
 call .venv\Scripts\activate.bat
-python start_gui.py
+.venv\Scripts\python.exe start_gui.py
 
 if %errorlevel% neq 0 (
     echo.

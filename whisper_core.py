@@ -68,7 +68,11 @@ class TranscriptionConfig:
     # Explicit values: "float16" | "bfloat16" | "float32".
     dtype: str = "auto"
     batch_size: int = 4
-    max_new_tokens: int = 225
+    # Whisper hard-caps total context at 448 tokens (incl. prompt/lang/task).
+    # For 20-28 s chunks of normal-density speech, real token counts rarely exceed
+    # ~100; budget=128 leaves headroom without spending decode time on padding.
+    # For very dense speech / hard chunks bump to 200-224 in GUI.
+    max_new_tokens: int = 128
     decode_profile: Literal["balanced", "quality"] = "balanced"
     target_db: float = -20.0
     # Compile model.forward with torch.compile. Adds ~30-60s warmup on the first
@@ -369,6 +373,17 @@ class WhisperCore:
                         self.log("torch.compile enabled (mode=reduce-overhead, dynamic).")
                     except Exception as e:
                         self.log(f"torch.compile setup failed ({e}); continuing without compile.")
+
+            # Warmup: одна холостая генерация, чтобы оплатить CUDA/SDPA init сейчас,
+            # а не на первом файле пользователя (иначе первый прогон висит 2–5 с).
+            try:
+                with torch.inference_mode():
+                    dummy = torch.zeros(1, 80, 3000, dtype=config.torch_dtype, device=config.device)
+                    self.model.generate(dummy, max_new_tokens=1)
+                self.log("Warmup pass complete.")
+            except Exception as e:
+                self.log(f"Warmup skipped: {e}")
+
             self.log("Model loading complete.")
         except Exception as e:
             self.log(f"Error loading model: {e}")
@@ -655,7 +670,7 @@ class WhisperCore:
             decode_kwargs["language"] = config.lang
             decode_kwargs["task"] = "transcribe"
         if config.decode_profile == "quality":
-            decode_kwargs["num_beams"] = 5
+            decode_kwargs["num_beams"] = 3
             decode_kwargs["length_penalty"] = 1.0
             decode_kwargs["early_stopping"] = False
 
@@ -726,12 +741,13 @@ class WhisperCore:
             "no_repeat_ngram_size": 5,
             "repetition_penalty": 1.1,
             "max_new_tokens": config.max_new_tokens,
+            "condition_on_prev_tokens": True,
         }
         if not config.auto_lang:
             gen_kwargs["language"] = config.lang
             gen_kwargs["task"] = "transcribe"
         if config.decode_profile == "quality":
-            gen_kwargs["num_beams"] = 5
+            gen_kwargs["num_beams"] = 3
             gen_kwargs["length_penalty"] = 1.0
             gen_kwargs["early_stopping"] = False
 
