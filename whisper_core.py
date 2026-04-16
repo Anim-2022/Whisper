@@ -378,7 +378,8 @@ class WhisperCore:
             # а не на первом файле пользователя (иначе первый прогон висит 2–5 с).
             try:
                 with torch.inference_mode():
-                    dummy = torch.zeros(1, 80, 3000, dtype=config.torch_dtype, device=config.device)
+                    mel_bins = getattr(self.model.config, "num_mel_bins", 80)
+                    dummy = torch.zeros(1, mel_bins, 3000, dtype=config.torch_dtype, device=config.device)
                     self.model.generate(dummy, max_new_tokens=1)
                 self.log("Warmup pass complete.")
             except Exception as e:
