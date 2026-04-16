@@ -49,7 +49,9 @@ class TranscriptionConfig:
     
     # Model / Compute
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    dtype: str = "float16" # "float16" or "float32"
+    # "auto" picks bf16 on Ampere+ (cc>=8.0), fp16 on older CUDA, fp32 on CPU.
+    # Explicit values: "float16" | "bfloat16" | "float32".
+    dtype: str = "auto"
     batch_size: int = 4
     max_new_tokens: int = 225
     decode_profile: Literal["balanced", "quality"] = "balanced"
@@ -63,9 +65,22 @@ class TranscriptionConfig:
         # Auto-adjust device/dtype
         if self.device == "cuda" and not torch.cuda.is_available():
             self.device = "cpu"
-        
+
         if self.device == "cpu":
+            # bf16/fp16 inference is unstable/slow on CPU for Whisper; force fp32.
             self.dtype = "float32"
+        elif self.dtype == "auto":
+            # Prefer bf16 on Ampere+ (compute capability 8.0+): same speed as fp16,
+            # much wider exponent range -> no NaNs in encoder LayerNorms on noisy
+            # audio. Fall back to fp16 on Turing/Volta and older.
+            try:
+                major, _ = torch.cuda.get_device_capability()
+            except Exception:
+                major = 0
+            self.dtype = "bfloat16" if major >= 8 else "float16"
+
+        if self.dtype not in {"float16", "bfloat16", "float32"}:
+            raise ValueError(f"dtype must be one of float16/bfloat16/float32/auto, got {self.dtype!r}")
 
         if self.chunk_sec <= 0:
             raise ValueError("chunk_sec must be positive")
@@ -86,7 +101,11 @@ class TranscriptionConfig:
 
     @property
     def torch_dtype(self):
-        return torch.float16 if self.dtype == "float16" else torch.float32
+        return {
+            "float16":  torch.float16,
+            "bfloat16": torch.bfloat16,
+            "float32":  torch.float32,
+        }[self.dtype]
 
 # -----------------------------------------------------------------------------
 # Core Engine Class
@@ -225,33 +244,66 @@ class WhisperCore:
             )
             
             self.log("Step 2/2: Loading weights (this may take a moment)...")
-            
-            # Check for accelerate for better loading
+
+            # Pick best attention implementation: FA2 if installed, otherwise SDPA
+            # (built into torch>=2.0). Falls back to "eager" if the runtime rejects
+            # the chosen impl on this model/dtype combo.
+            attn_impl = "sdpa"
+            if config.device != "cpu" and config.dtype in ("float16", "bfloat16"):
+                try:
+                    import flash_attn  # noqa: F401
+                    attn_impl = "flash_attention_2"
+                except ImportError:
+                    pass
+
+            # device_map="auto" is only useful for multi-GPU or CPU offload of large
+            # models. On a single GPU it adds accelerate hooks that block plain .to()
+            # movement and can spuriously offload layers. Restrict accordingly.
+            multi_gpu = (
+                config.device != "cpu"
+                and torch.cuda.is_available()
+                and torch.cuda.device_count() > 1
+            )
             has_accelerate = False
-            try:
-                import accelerate
-                has_accelerate = True
-            except ImportError:
-                pass
+            if multi_gpu:
+                try:
+                    import accelerate  # noqa: F401
+                    has_accelerate = True
+                except ImportError:
+                    pass
 
             load_kwargs = {
                 "torch_dtype": config.torch_dtype,
                 "low_cpu_mem_usage": True,
                 "local_files_only": True,
+                "attn_implementation": attn_impl,
             }
-            if has_accelerate and config.device != "cpu":
+            if has_accelerate and multi_gpu:
                 load_kwargs["device_map"] = "auto"
 
-            self.model = WhisperForConditionalGeneration.from_pretrained(
-                str(resolved_model_path),
-                **load_kwargs
-            )
-            
-            # If not using device_map, manually move to device
+            try:
+                self.model = WhisperForConditionalGeneration.from_pretrained(
+                    str(resolved_model_path),
+                    **load_kwargs,
+                )
+                self.log(f"Attention implementation: {attn_impl}")
+            except (ValueError, ImportError, RuntimeError) as e:
+                # FA2/SDPA may be unavailable for some model+dtype combos; fall back.
+                if attn_impl != "eager":
+                    self.log(f"attn_implementation={attn_impl!r} failed ({e}); retrying with 'eager'.")
+                    load_kwargs["attn_implementation"] = "eager"
+                    self.model = WhisperForConditionalGeneration.from_pretrained(
+                        str(resolved_model_path),
+                        **load_kwargs,
+                    )
+                else:
+                    raise
+
+            # If not using device_map, manually move to device.
             if "device_map" not in load_kwargs:
                 self.log(f"Moving model to {config.device}...")
                 self.model = self.model.to(config.device)
-                
+
             self.model.eval()
             self.log("Model loading complete.")
         except Exception as e:

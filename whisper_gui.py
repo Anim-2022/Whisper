@@ -72,7 +72,7 @@ UI_TEXT = {
         "label_device": "Device:",
         "help_device": "CUDA is fastest on NVIDIA GPUs. CPU is slower but safest. MPS is mainly for Apple Silicon if available.",
         "label_precision": "Precision:",
-        "help_precision": "float16 is usually the right choice on a GPU because it is faster and lighter. float32 is safer on CPU or if you hit strange precision issues.",
+        "help_precision": "'auto' picks bfloat16 on RTX 30/40/50-series GPUs (most stable, same speed as fp16) and float16 on older CUDA. Force 'float16' if VRAM is very tight on Turing/Volta. 'float32' is safer on CPU or for debugging precision issues.",
         "label_batch_size": "Batch size:",
         "help_batch_size": "Higher batch size can be faster, but it also uses more VRAM. Lower it first if you get memory errors.",
         "label_use_vad": "Use Silero VAD:",
@@ -175,7 +175,7 @@ UI_TEXT = {
         "label_device": "Устройство:",
         "help_device": "CUDA быстрее всего на NVIDIA GPU. CPU медленнее, но надёжнее. MPS в основном нужен для Apple Silicon, если доступен.",
         "label_precision": "Точность:",
-        "help_precision": "float16 обычно лучше для GPU, потому что работает быстрее и требует меньше памяти. float32 безопаснее на CPU или при странных проблемах с точностью.",
+        "help_precision": "'auto' выбирает bfloat16 на GPU RTX 30/40/50 (стабильнее, скорость как у fp16) и float16 на более старых CUDA. Принудительно 'float16' стоит ставить только если на Turing/Volta мало VRAM. 'float32' — безопасный режим для CPU и отладки точности.",
         "label_batch_size": "Размер батча:",
         "help_batch_size": "Больший батч может ускорить обработку, но использует больше видеопамяти. Если возникают ошибки памяти, сначала уменьшайте именно его.",
         "label_use_vad": "Использовать Silero VAD:",
@@ -843,7 +843,7 @@ class WhisperGUI(ctk.CTk):
         self.precision_label.grid(row=4, column=0, sticky="w", padx=20, pady=5)
         self.combo_dtype = ctk.CTkComboBox(
             t,
-            values=["float16", "float32"],
+            values=["auto", "bfloat16", "float16", "float32"],
             height=34,
             command=lambda _value: self.refresh_runtime_summary(),
         )
@@ -1091,7 +1091,9 @@ class WhisperGUI(ctk.CTk):
 
         if preset_key == "fast":
             self.combo_device.set("cuda" if use_cuda else "cpu")
-            self.combo_dtype.set("float16" if use_cuda else "float32")
+            # "auto" lets WhisperCore pick bf16 on Ampere+ (cc>=8), fp16 on older
+            # CUDA, fp32 on CPU — bf16 is more numerically stable for Whisper.
+            self.combo_dtype.set("auto" if use_cuda else "float32")
             self.set_entry_value(self.entry_batch, 4 if use_cuda else 1)
             self.set_decode_profile_selection("balanced")
             self.set_entry_value(self.entry_target_db, -20.0)
@@ -1105,7 +1107,9 @@ class WhisperGUI(ctk.CTk):
             self.update_vad_label(0.5)
         elif preset_key == "accurate":
             self.combo_device.set("cuda" if use_cuda else "cpu")
-            self.combo_dtype.set("float16" if use_cuda else "float32")
+            # "auto" lets WhisperCore pick bf16 on Ampere+ (cc>=8), fp16 on older
+            # CUDA, fp32 on CPU — bf16 is more numerically stable for Whisper.
+            self.combo_dtype.set("auto" if use_cuda else "float32")
             self.set_entry_value(self.entry_batch, 2 if use_cuda else 1)
             self.set_decode_profile_selection("quality")
             self.set_entry_value(self.entry_target_db, -20.0)
@@ -1119,7 +1123,9 @@ class WhisperGUI(ctk.CTk):
             self.update_vad_label(0.45)
         elif preset_key == "noisy":
             self.combo_device.set("cuda" if use_cuda else "cpu")
-            self.combo_dtype.set("float16" if use_cuda else "float32")
+            # "auto" lets WhisperCore pick bf16 on Ampere+ (cc>=8), fp16 on older
+            # CUDA, fp32 on CPU — bf16 is more numerically stable for Whisper.
+            self.combo_dtype.set("auto" if use_cuda else "float32")
             self.set_entry_value(self.entry_batch, 2 if use_cuda else 1)
             self.set_decode_profile_selection("quality")
             self.set_entry_value(self.entry_target_db, -20.0)
