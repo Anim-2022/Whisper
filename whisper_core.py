@@ -326,7 +326,12 @@ class WhisperCore:
             target_rms = 10 ** (target_db / 20)
             audio = audio * (target_rms / rms)
 
-        audio = np.clip(audio, -1.0, 1.0)
+        # Peak rescale (not clip): preserves dynamics of percussive/dynamic recordings.
+        # Hard clipping at 1.0 after RMS gain produces flat-tops -> intermodulation
+        # distortion that the encoder hears as garbled phonemes.
+        peak = float(np.max(np.abs(audio))) if audio.size else 0.0
+        if peak > 0.99:
+            audio = audio * (0.99 / peak)
         
         # Resample
         if sr != target_sr:
@@ -508,9 +513,14 @@ class WhisperCore:
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
+                # Split with 0.5s overlap on each side so stitch_text has real shared
+                # acoustic content to align — splitting at exact midpoint cuts a word.
+                overlap = sr // 2
                 mid = len(chunk) // 2
-                left = self.transcribe_chunk_safe(chunk[:mid], sr, config)
-                right = self.transcribe_chunk_safe(chunk[mid:], sr, config)
+                left_end   = min(len(chunk), mid + overlap)
+                right_start = max(0, mid - overlap)
+                left  = self.transcribe_chunk_safe(chunk[:left_end], sr, config)
+                right = self.transcribe_chunk_safe(chunk[right_start:], sr, config)
                 return self.stitch_text(left, right)
             raise
 
@@ -587,6 +597,9 @@ class WhisperCore:
                 if self.stop_requested:
                     self.log("Stopped by user.")
                     break
+                if not segments:
+                    self.log(f"No speech detected in {file_path.name}; skipping.")
+                    continue
                 chunks = [audio[s:e] for s, e in segments]
                 
                 # Transcribe
@@ -650,27 +663,51 @@ class WhisperCore:
                     self.log("Stopped by user.")
                     break
                 
-                # Stitching/Aggregation
+                # Stitching/Aggregation.
+                # Two distinct cases that must NOT be conflated:
+                #   (A) Acoustic overlap (s < previous_end_in_samples): segments share
+                #       audio (sliding window or split-with-overlap path). Whisper will
+                #       transcribe the shared region twice, so we need stitch_text() to
+                #       detect and remove the duplicate words.
+                #   (B) No overlap (consecutive VAD segments): just concatenate. Calling
+                #       stitch_text on these is the bug — it can find a coincidental
+                #       3-word match between unrelated sentences and DELETE the prefix
+                #       of the second sentence.
+                # The time_gap heuristic decides whether to merge into one final entry
+                # (close in time / no terminal punctuation) or start a new entry.
                 self.log("Finalizing text...")
                 final_segments = []
+                last_end_sample = -1  # end of previous accepted source segment, in samples
                 for j, ((s, e), text) in enumerate(zip(segments, all_texts)):
                     text = text.strip()
                     if not text:
                         continue
-                        
+
+                    overlapping = (s < last_end_sample)
+
                     if not final_segments:
                         final_segments.append([text, s/sr, e/sr])
                     else:
                         prev_text, ps, pe = final_segments[-1]
-                        # Only stitch if segments are very close or overlapping (sliding window)
-                        # or if previous doesn't end with punctuation
                         time_gap = (s/sr) - pe
-                        
-                        if time_gap < 0.5 or not prev_text.rstrip().endswith(('.', '!', '?', '。', '！', '？')):
+                        close_in_time = time_gap < 0.5
+                        no_terminal_punct = not prev_text.rstrip().endswith(('.', '!', '?', '。', '！', '？'))
+
+                        if overlapping:
+                            # Real shared audio -> dedupe via overlap matcher.
                             joined = self.stitch_text(prev_text, text)
                             final_segments[-1] = [joined, ps, e/sr]
+                        elif close_in_time or no_terminal_punct:
+                            # Adjacent but non-overlapping -> safe concatenate (no word loss).
+                            final_segments[-1] = [
+                                prev_text.rstrip() + " " + text.lstrip(),
+                                ps,
+                                e/sr,
+                            ]
                         else:
                             final_segments.append([text, s/sr, e/sr])
+
+                    last_end_sample = e
                 
                 # Convert back to tuples
                 final_segments = [tuple(x) for x in final_segments]
