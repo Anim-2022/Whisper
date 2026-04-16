@@ -109,8 +109,7 @@ class WhisperCore:
         # VAD
         self.vad_model = None
         self.vad_utils = None
-        self.supports_attention_mask = True
-        
+
         self.current_config = None
         
         # Internal cache for faster subsequent loads or checks
@@ -519,59 +518,33 @@ class WhisperCore:
         """Raw model generation."""
         if not chunks: return []
 
-        forced_ids = None if config.auto_lang else self.processor.get_decoder_prompt_ids(
-            language=config.lang, task="transcribe"
-        )
-
+        # Native language/task kwargs (replaces deprecated forced_decoder_ids path).
         decode_kwargs = {
-            "forced_decoder_ids": forced_ids,
             "max_new_tokens": config.max_new_tokens,
-            "temperature": 0.0,
             "do_sample": False,
             "repetition_penalty": 1.1,
             "no_repeat_ngram_size": 5,
         }
+        if not config.auto_lang:
+            decode_kwargs["language"] = config.lang
+            decode_kwargs["task"] = "transcribe"
         if config.decode_profile == "quality":
             decode_kwargs["num_beams"] = 5
-            decode_kwargs["early_stopping"] = True
+            decode_kwargs["length_penalty"] = 1.0
+            decode_kwargs["early_stopping"] = False
 
         with torch.inference_mode():
-            try:
-                processed = self.processor(
-                    chunks,
-                    sampling_rate=sr,
-                    padding=True,
-                    return_attention_mask=True,
-                    return_tensors="pt"
-                )
-            except TypeError as e:
-                if "return_attention_mask" not in str(e).lower():
-                    raise
-                self.log("Whisper processor does not support return_attention_mask in this transformers build. Retrying.")
-                processed = self.processor(
-                    chunks,
-                    sampling_rate=sr,
-                    padding=True,
-                    return_tensors="pt"
-                )
+            processed = self.processor(
+                chunks,
+                sampling_rate=sr,
+                return_tensors="pt",
+            )
             input_features = processed.input_features.to(config.device, dtype=config.torch_dtype)
-            attention_mask = getattr(processed, "attention_mask", None)
-            if attention_mask is not None:
-                attention_mask = attention_mask.to(config.device)
 
-            generate_kwargs = dict(decode_kwargs)
-            if attention_mask is not None and self.supports_attention_mask:
-                generate_kwargs["attention_mask"] = attention_mask
-
-            try:
-                predicted_ids = self.model.generate(input_features, **generate_kwargs)
-            except TypeError as e:
-                if "attention_mask" not in str(e).lower() or not self.supports_attention_mask:
-                    raise
-                self.supports_attention_mask = False
-                self.log("Whisper generate() does not support attention_mask in this transformers build. Retrying.")
-                generate_kwargs.pop("attention_mask", None)
-                predicted_ids = self.model.generate(input_features, **generate_kwargs)
+            # Note: do NOT forward processor's attention_mask to Whisper.generate() —
+            # it is a waveform-level mask, not aligned to the encoder's mel frames.
+            # Whisper's encoder operates on a fixed 30 s mel canvas and handles padding internally.
+            predicted_ids = self.model.generate(input_features, **decode_kwargs)
 
             texts = self.processor.batch_decode(predicted_ids, skip_special_tokens=True)
             return list(texts)
