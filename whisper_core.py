@@ -22,7 +22,22 @@ import soundfile as sf
 # VAD: using Silero via torch.hub (no compilation needed)
 HAS_VAD = True
 
-from transformers import WhisperProcessor, WhisperForConditionalGeneration
+from transformers import WhisperProcessor, WhisperForConditionalGeneration, pipeline
+
+
+def _fmt_srt_time(sec: float) -> str:
+    """SRT timestamp format: HH:MM:SS,mmm (always 3-digit ms, comma separator)."""
+    if sec is None or sec < 0:
+        sec = 0.0
+    ms = int(round((sec - int(sec)) * 1000))
+    if ms == 1000:
+        ms = 0
+        sec_int = int(sec) + 1
+    else:
+        sec_int = int(sec)
+    m, s_ = divmod(sec_int, 60)
+    h, m = divmod(m, 60)
+    return f"{h:02d}:{m:02d}:{s_:02d},{ms:03d}"
 
 # -----------------------------------------------------------------------------
 # Configuration
@@ -60,6 +75,15 @@ class TranscriptionConfig:
     # batch but yields +10-25% throughput on Ampere/Ada with SDPA. Off by default
     # because recompiles on shape changes can spam logs.
     use_compile: bool = False
+    # Use HF transformers' built-in long-form ASR pipeline instead of the manual
+    # VAD->chunk->batch->stitch loop. The pipeline packs short segments into 30 s
+    # mel windows (so the encoder isn't wasted on padding), uses Whisper-aware
+    # token-level stitching with timestamps, and handles language/task internally.
+    # Off by default for rollback safety; enable once validated on your corpus.
+    use_hf_pipeline: bool = False
+    # Stride (seconds) on each side of the 30 s pipeline window. 5 s is the HF
+    # default and matches Whisper's training stride.
+    pipeline_stride_sec: float = 5.0
     
     # Output
     save_srt: bool = False
@@ -128,7 +152,9 @@ class WhisperCore:
         self.stop_requested = False
         self.processor = None
         self.model = None
-        
+        # HF asr pipeline (lazily built on first use when config.use_hf_pipeline=True)
+        self.asr_pipeline = None
+
         # VAD
         self.vad_model = None
         self.vad_utils = None
@@ -650,6 +676,63 @@ class WhisperCore:
             return max(1, min(config.batch_size, 2))
         return max(1, config.batch_size)
 
+    def _ensure_pipeline(self, config: TranscriptionConfig):
+        """Build the HF ASR pipeline lazily after the model is loaded."""
+        if self.asr_pipeline is not None:
+            return
+        if self.model is None or self.processor is None:
+            raise RuntimeError("Model must be loaded before building HF pipeline")
+        # device for pipeline: torch.device for cuda, -1 for CPU
+        if config.device == "cpu":
+            pipe_device = -1
+        else:
+            pipe_device = torch.device(config.device)
+        self.asr_pipeline = pipeline(
+            "automatic-speech-recognition",
+            model=self.model,
+            tokenizer=self.processor.tokenizer,
+            feature_extractor=self.processor.feature_extractor,
+            torch_dtype=config.torch_dtype,
+            device=pipe_device,
+        )
+        self.log("HF ASR pipeline initialized.")
+
+    def _run_pipeline(self, audio: np.ndarray, sr: int, config: TranscriptionConfig
+                     ) -> Tuple[str, List[dict]]:
+        """One-shot long-form transcription via HF pipeline.
+        Returns (full_text, chunks) where chunks is a list of
+        {'text': str, 'timestamp': (start_sec, end_sec)} dicts.
+        """
+        self._ensure_pipeline(config)
+
+        gen_kwargs = {
+            "no_repeat_ngram_size": 5,
+            "repetition_penalty": 1.1,
+            "max_new_tokens": config.max_new_tokens,
+        }
+        if not config.auto_lang:
+            gen_kwargs["language"] = config.lang
+            gen_kwargs["task"] = "transcribe"
+        if config.decode_profile == "quality":
+            gen_kwargs["num_beams"] = 5
+            gen_kwargs["length_penalty"] = 1.0
+            gen_kwargs["early_stopping"] = False
+
+        bs = self.get_effective_batch_size(config)
+
+        with torch.inference_mode():
+            result = self.asr_pipeline(
+                {"array": audio.astype(np.float32, copy=False), "sampling_rate": sr},
+                chunk_length_s=30.0,
+                stride_length_s=(config.pipeline_stride_sec, config.pipeline_stride_sec),
+                batch_size=bs,
+                generate_kwargs=gen_kwargs,
+                return_timestamps=True,
+            )
+        text = (result.get("text") or "").strip()
+        chunks = result.get("chunks") or []
+        return text, chunks
+
     def process_files(self, file_paths: List[Path], config: TranscriptionConfig):
         """Main entry point to process a list of files."""
         self.stop_requested = False
@@ -678,6 +761,44 @@ class WhisperCore:
                     self.log(f"Failed to read audio {file_path.name}: {e}")
                     continue
 
+                # ----- HF pipeline path (single-shot long-form) -----
+                if config.use_hf_pipeline:
+                    self.update_progress((idx + 0.05) / overall_total,
+                                         f"Pipeline: {file_path.name}")
+                    try:
+                        text, pipe_chunks = self._run_pipeline(audio, sr, config)
+                    except RuntimeError as e:
+                        if "out of memory" not in str(e).lower():
+                            raise
+                        # OOM in pipeline -> drop pipeline state, free VRAM, fall back
+                        # to the manual VAD/batch path for this file.
+                        self.log("OOM in HF pipeline. Falling back to manual loop for this file...")
+                        self.asr_pipeline = None
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                    else:
+                        # Save TXT
+                        stem = file_path.stem
+                        txt_path = config.output_dir / f"{stem}.txt"
+                        with open(txt_path, "w", encoding="utf-8") as f:
+                            f.write(text)
+                        self.log(f"Saved TXT: {txt_path.name}")
+                        # Save SRT from pipeline chunks
+                        if config.save_srt and pipe_chunks:
+                            srt_path = config.output_dir / f"{stem}.srt"
+                            with open(srt_path, "w", encoding="utf-8") as f:
+                                for k, ch in enumerate(pipe_chunks, 1):
+                                    ts = ch.get("timestamp") or (None, None)
+                                    s_sec = ts[0] if ts[0] is not None else 0.0
+                                    e_sec = ts[1] if ts[1] is not None else (s_sec + 1.0)
+                                    f.write(f"{k}\n{_fmt_srt_time(s_sec)} --> {_fmt_srt_time(e_sec)}\n{(ch.get('text') or '').strip()}\n\n")
+                            self.log(f"Saved SRT: {srt_path.name}")
+                        self.update_progress((idx + 1.0) / overall_total,
+                                             f"Done: {file_path.name}")
+                        continue  # next file
+
+                # ----- Manual VAD/batch path (fallback and default) -----
                 # Prepare Segments
                 segments = self.prepare_segments(audio, sr, config)
                 if self.stop_requested:
@@ -811,13 +932,7 @@ class WhisperCore:
                     srt_path = config.output_dir / f"{stem}.srt"
                     with open(srt_path, "w", encoding="utf-8") as f:
                         for k, (t, s, e) in enumerate(final_segments, 1):
-                            # format time helper
-                            def fmt(sec):
-                                ms = int((sec % 1) * 1000)
-                                m, s_ = divmod(int(sec), 60)
-                                h, m = divmod(m, 60)
-                                return f"{h:02d}:{m:02d}:{s_:02d},{ms:03d}"
-                            f.write(f"{k}\n{fmt(s)} --> {fmt(e)}\n{t}\n\n")
+                            f.write(f"{k}\n{_fmt_srt_time(s)} --> {_fmt_srt_time(e)}\n{t}\n\n")
                     self.log(f"Saved SRT: {srt_path.name}")
                     
             except Exception as e:
