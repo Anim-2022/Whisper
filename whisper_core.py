@@ -84,6 +84,10 @@ class TranscriptionConfig:
     # Stride (seconds) on each side of the 30 s pipeline window. 5 s is the HF
     # default and matches Whisper's training stride.
     pipeline_stride_sec: float = 5.0
+    # Peak amplitude threshold below which a chunk is considered silent and
+    # skipped by the manual-path batch loop (to avoid Whisper hallucinations
+    # on near-silence). 0.005 ~ -46 dBFS after normalization.
+    silence_amplitude_threshold: float = 0.005
     
     # Output
     save_srt: bool = False
@@ -687,14 +691,27 @@ class WhisperCore:
             pipe_device = -1
         else:
             pipe_device = torch.device(config.device)
-        self.asr_pipeline = pipeline(
-            "automatic-speech-recognition",
+        # transformers>=5 renamed the pipeline kwarg to 'dtype' (torch_dtype still
+        # works but emits a deprecation warning). Accept either, prefer the new name.
+        pipe_kwargs = dict(
             model=self.model,
             tokenizer=self.processor.tokenizer,
             feature_extractor=self.processor.feature_extractor,
-            torch_dtype=config.torch_dtype,
             device=pipe_device,
         )
+        try:
+            self.asr_pipeline = pipeline(
+                "automatic-speech-recognition",
+                dtype=config.torch_dtype,
+                **pipe_kwargs,
+            )
+        except TypeError:
+            # older transformers that don't know 'dtype' yet
+            self.asr_pipeline = pipeline(
+                "automatic-speech-recognition",
+                torch_dtype=config.torch_dtype,
+                **pipe_kwargs,
+            )
         self.log("HF ASR pipeline initialized.")
 
     def _run_pipeline(self, audio: np.ndarray, sr: int, config: TranscriptionConfig
@@ -737,12 +754,14 @@ class WhisperCore:
         """Main entry point to process a list of files."""
         self.stop_requested = False
         self.current_config = config
-        
+
+        # Create the destination before touching the model — a slow or failing
+        # load should not cost us the ability to save once we do have output.
+        config.output_dir.mkdir(parents=True, exist_ok=True)
+
         if not self.model:
             self.load_model(config)
-            
-        config.output_dir.mkdir(parents=True, exist_ok=True)
-        
+
         overall_total = len(file_paths)
         
         for idx, file_path in enumerate(file_paths):
@@ -755,7 +774,9 @@ class WhisperCore:
             try:
                 # Load Audio
                 try:
-                    audio, sr = sf.read(str(file_path))
+                    # dtype='float32' avoids soundfile's default float64 for PCM_24
+                    # and skips a second pass of type conversion in normalize_audio.
+                    audio, sr = sf.read(str(file_path), dtype="float32")
                     audio, sr = self.normalize_audio(audio, sr, target_db=config.target_db)
                 except Exception as e:
                     self.log(f"Failed to read audio {file_path.name}: {e}")
@@ -826,16 +847,18 @@ class WhisperCore:
                     # Pre-filter extremely quiet chunks to avoid hallucinations
                     valid_batch = []
                     valid_indices = []
+                    sil_thr = config.silence_amplitude_threshold
                     for idx_b, chunk in enumerate(batch):
-                        if np.max(np.abs(chunk)) > 0.005: 
+                        if chunk.size and float(np.max(np.abs(chunk))) > sil_thr:
                             valid_batch.append(chunk)
                             valid_indices.append(idx_b)
-                    
-                    # File-level progress
+
+                    # File-level progress. Status string is localized in the GUI
+                    # layer; emit a neutral format string here.
                     file_percent = min(1.0, (i + len(batch)) / total_chunks)
                     overall_percent = (idx + file_percent) / overall_total
                     pct = int(file_percent * 100)
-                    self.update_progress(overall_percent, f"Обработка: {pct}%")
+                    self.update_progress(overall_percent, f"transcribing:{pct}")
                     
                     try:
                         if valid_batch:
@@ -849,13 +872,15 @@ class WhisperCore:
                             texts = [""] * len(batch)
                             
                         all_texts.extend(texts)
-                        # Log preview for debug
-                        if texts and texts[0].strip():
-                            full_text = texts[0].strip()
-                            snippet = full_text[:100] + "..." if len(full_text) > 100 else full_text
-                            self.log(f"  → {snippet}")
-                        elif texts:
-                            self.log(f"  → [тишина]")
+                        # Log a short preview of every item in the batch (not just
+                        # texts[0]) so debug output reflects the full work done.
+                        for t_idx, t in enumerate(texts):
+                            tt = (t or "").strip()
+                            if not tt:
+                                self.log(f"  [{i + t_idx}] -> [silence]")
+                            else:
+                                snippet = tt[:100] + "..." if len(tt) > 100 else tt
+                                self.log(f"  [{i + t_idx}] -> {snippet}")
                     except RuntimeError as e:
                         if "out of memory" in str(e).lower():
                             self.log("OOM in batch. Falling back to serial...")

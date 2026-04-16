@@ -581,6 +581,12 @@ class WhisperGUI(ctk.CTk):
             return self.t("status_stopped")
         if clean_status.startswith("Processing "):
             return f"{self.t('status_processing_file_prefix')}{clean_status[len('Processing '):]}"
+        if clean_status.startswith("Pipeline: "):
+            return f"{self.t('status_processing_file_prefix')}{clean_status[len('Pipeline: '):]}"
+        if clean_status.startswith("transcribing:"):
+            # Neutral status code emitted by whisper_core. Format: "transcribing:<pct>"
+            return self.t("status_processing_percent", percent=clean_status.split(":", 1)[1].strip())
+        # Legacy: older cores emitted the Russian hardcoded string directly.
         if clean_status.startswith("Обработка:"):
             return self.t("status_processing_percent", percent=clean_status.split(":", 1)[1].strip())
         return clean_status
