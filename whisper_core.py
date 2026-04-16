@@ -56,6 +56,10 @@ class TranscriptionConfig:
     max_new_tokens: int = 225
     decode_profile: Literal["balanced", "quality"] = "balanced"
     target_db: float = -20.0
+    # Compile model.forward with torch.compile. Adds ~30-60s warmup on the first
+    # batch but yields +10-25% throughput on Ampere/Ada with SDPA. Off by default
+    # because recompiles on shape changes can spam logs.
+    use_compile: bool = False
     
     # Output
     save_srt: bool = False
@@ -305,6 +309,36 @@ class WhisperCore:
                 self.model = self.model.to(config.device)
 
             self.model.eval()
+
+            # Optional torch.compile pass. Wrap model.forward, not the whole module —
+            # generate() has Python-side control flow that defeats fullgraph=True.
+            # mode='reduce-overhead' targets the per-step decoder forward, which is
+            # what we re-enter on every generated token.
+            #
+            # The default Inductor backend requires Triton, which is not packaged
+            # with PyTorch on Windows. Silently skip compile when Triton is missing
+            # rather than crashing on the first forward pass.
+            if config.use_compile and config.device != "cpu" and hasattr(torch, "compile"):
+                try:
+                    import triton  # noqa: F401
+                    triton_ok = True
+                except ImportError:
+                    triton_ok = False
+
+                if not triton_ok:
+                    self.log("torch.compile requested but Triton is not installed "
+                             "(install 'triton' wheel for Windows). Skipping compile.")
+                else:
+                    try:
+                        self.model.forward = torch.compile(
+                            self.model.forward,
+                            mode="reduce-overhead",
+                            fullgraph=False,
+                            dynamic=True,   # batch shape varies; avoids constant recompile
+                        )
+                        self.log("torch.compile enabled (mode=reduce-overhead, dynamic).")
+                    except Exception as e:
+                        self.log(f"torch.compile setup failed ({e}); continuing without compile.")
             self.log("Model loading complete.")
         except Exception as e:
             self.log(f"Error loading model: {e}")
