@@ -16,6 +16,7 @@ except ImportError:
 
 # Single source of truth for theme/colors/sizes/lists/presets lives in gui/.
 from gui import constants as C
+from gui import settings_store
 from gui.i18n import UI_TEXT
 
 
@@ -203,6 +204,14 @@ class WhisperGUI(ctk.CTk):
         self.refresh_local_models()
         self.set_preset_selection("fast")
         self.apply_preset("fast")
+
+        # Load persisted user settings (window geometry, last preset, paths,
+        # tweaked numeric fields). This must run AFTER apply_preset("fast") so
+        # individual saved field values can override the preset baseline.
+        self._load_persisted_settings()
+
+        # Persist current values when the user closes the window.
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
 
         self.after(100, self.process_queues)
 
@@ -924,6 +933,186 @@ class WhisperGUI(ctk.CTk):
 
     def update_vad_label(self, val):
         self.lbl_vad_val.configure(text=f"{float(val):.2f}")
+
+    # ------------------------------------------------------------------
+    # Settings persistence (Phase B)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _safe_int(value, default):
+        try:
+            return int(float(str(value).strip()))
+        except (ValueError, TypeError):
+            return default
+
+    @staticmethod
+    def _safe_float(value, default):
+        try:
+            return float(str(value).strip())
+        except (ValueError, TypeError):
+            return default
+
+    def _apply_persisted_entry(self, entry, value):
+        """Write `value` into a CTkEntry only if it looks meaningful.
+
+        Empty strings and None are skipped so the preset-driven default that
+        was already inserted in apply_preset() stays put.
+        """
+        if value is None or value == "":
+            return
+        self.set_entry_value(entry, value)
+
+    def _load_persisted_settings(self):
+        """Apply ~/.whisper_gui/settings.json on top of preset-fast defaults.
+
+        This runs after build_*_tab and apply_preset("fast"), so individual
+        keys override the preset baseline and missing keys keep the baseline.
+        Never raises: on any malformed value we silently fall through.
+        """
+        self.settings = settings_store.load()
+        s = self.settings
+
+        # Window geometry — best-effort, Tk silently rejects garbage strings.
+        geometry = s.get("window_geometry")
+        if isinstance(geometry, str) and geometry:
+            try:
+                self.geometry(geometry)
+            except Exception:
+                pass
+
+        # UI language: switch + relocalize labels if different.
+        lang = s.get("ui_language")
+        if lang in C.UI_LANGUAGES and lang != self.ui_language:
+            self.ui_language = lang
+            self.apply_localization()
+
+        # Preset (re-apply so its baseline matches what the user last chose;
+        # later we override individual fields the user tweaked manually).
+        preset_key = s.get("preset")
+        if preset_key in self.preset_keys and preset_key != "fast":
+            self.set_preset_selection(preset_key)
+            self.apply_preset(preset_key)
+
+        # Files
+        audio_dir = s.get("audio_dir")
+        if isinstance(audio_dir, str) and audio_dir:
+            self.entry_audio.delete(0, "end")
+            self.entry_audio.insert(0, audio_dir)
+        output_dir = s.get("output_dir")
+        if isinstance(output_dir, str) and output_dir:
+            self.entry_output.delete(0, "end")
+            self.entry_output.insert(0, output_dir)
+
+        # Model — make sure custom paths still appear in the combo's list.
+        model_path = s.get("model_path")
+        if isinstance(model_path, str) and model_path:
+            current_values = list(self.combo_model.cget("values") or [])
+            if model_path not in current_values:
+                current_values.append(model_path)
+                self.combo_model.configure(values=current_values)
+            self.combo_model.set(model_path)
+
+        # Transcription language + auto-detect
+        trans_lang = s.get("transcription_language")
+        if trans_lang in C.TRANSCRIPTION_LANGUAGES:
+            self.combo_lang.set(trans_lang)
+        if s.get("auto_lang"):
+            self.check_auto_lang.select()
+        elif "auto_lang" in s:
+            self.check_auto_lang.deselect()
+
+        # Compute (clamp cuda→cpu when no GPU is present)
+        device = s.get("device")
+        if device in C.DEVICES:
+            if device == "cuda" and not self.has_cuda:
+                device = "cpu"
+            self.combo_device.set(device)
+        dtype = s.get("dtype")
+        if dtype in C.DTYPES:
+            self.combo_dtype.set(dtype)
+
+        # Numeric overrides on top of the preset baseline
+        self._apply_persisted_entry(self.entry_batch, s.get("batch_size"))
+        self._apply_persisted_entry(self.entry_max_tokens, s.get("max_new_tokens"))
+        self._apply_persisted_entry(self.entry_chunk_sec, s.get("chunk_sec"))
+        self._apply_persisted_entry(self.entry_overlap_sec, s.get("overlap_sec"))
+        self._apply_persisted_entry(self.entry_target_db, s.get("target_db"))
+        self._apply_persisted_entry(self.entry_vad_silence, s.get("vad_silence_ms"))
+        self._apply_persisted_entry(self.entry_vad_merge_gap, s.get("vad_merge_gap"))
+
+        # Decode profile
+        decode = s.get("decode_profile")
+        if decode in self.decode_profile_keys:
+            self.set_decode_profile_selection(decode)
+
+        # VAD checkbox + threshold (respect local availability for the box)
+        if "use_vad" in s:
+            if s.get("use_vad") and self.has_local_vad:
+                self.check_vad.select()
+            else:
+                self.check_vad.deselect()
+        vad_threshold = s.get("vad_threshold")
+        if isinstance(vad_threshold, (int, float)):
+            self.slider_vad.set(float(vad_threshold))
+            self.update_vad_label(float(vad_threshold))
+
+        # SRT toggle
+        if "save_srt" in s:
+            if s.get("save_srt"):
+                self.check_srt.select()
+            else:
+                self.check_srt.deselect()
+
+        # Reflect any device/model/lang change in the runtime summary text.
+        self.refresh_runtime_summary()
+
+    def _collect_settings_snapshot(self) -> dict:
+        """Read current widget values into a JSON-serializable settings dict."""
+        defaults = settings_store.DEFAULTS
+        try:
+            geometry = self.winfo_geometry()
+        except Exception:
+            geometry = C.WINDOW_GEOMETRY
+        return {
+            "schema_version": settings_store.SCHEMA_VERSION,
+            "window_geometry": geometry,
+            "ui_language": self.ui_language,
+            "transcription_language": self.combo_lang.get() if hasattr(self, "combo_lang") else defaults["transcription_language"],
+            "auto_lang": bool(self.check_auto_lang.get()) if hasattr(self, "check_auto_lang") else False,
+            "preset": self.selected_preset_key(),
+            "audio_dir": self.entry_audio.get().strip() if hasattr(self, "entry_audio") else "",
+            "output_dir": self.entry_output.get().strip() if hasattr(self, "entry_output") else "",
+            "model_path": self.combo_model.get().strip() if hasattr(self, "combo_model") else defaults["model_path"],
+            "device": self.combo_device.get() if hasattr(self, "combo_device") else defaults["device"],
+            "dtype": self.combo_dtype.get() if hasattr(self, "combo_dtype") else defaults["dtype"],
+            "batch_size": self._safe_int(self.entry_batch.get(), defaults["batch_size"]) if hasattr(self, "entry_batch") else defaults["batch_size"],
+            "decode_profile": self.selected_decode_profile_key() if hasattr(self, "combo_decode") else defaults["decode_profile"],
+            "max_new_tokens": self._safe_int(self.entry_max_tokens.get(), defaults["max_new_tokens"]) if hasattr(self, "entry_max_tokens") else defaults["max_new_tokens"],
+            "chunk_sec": self._safe_float(self.entry_chunk_sec.get(), defaults["chunk_sec"]) if hasattr(self, "entry_chunk_sec") else defaults["chunk_sec"],
+            "overlap_sec": self._safe_float(self.entry_overlap_sec.get(), defaults["overlap_sec"]) if hasattr(self, "entry_overlap_sec") else defaults["overlap_sec"],
+            "target_db": self._safe_float(self.entry_target_db.get(), defaults["target_db"]) if hasattr(self, "entry_target_db") else defaults["target_db"],
+            "use_vad": bool(self.check_vad.get()) if hasattr(self, "check_vad") else defaults["use_vad"],
+            "vad_threshold": float(self.slider_vad.get()) if hasattr(self, "slider_vad") else defaults["vad_threshold"],
+            "vad_silence_ms": self._safe_int(self.entry_vad_silence.get(), defaults["vad_silence_ms"]) if hasattr(self, "entry_vad_silence") else defaults["vad_silence_ms"],
+            "vad_merge_gap": self._safe_float(self.entry_vad_merge_gap.get(), defaults["vad_merge_gap"]) if hasattr(self, "entry_vad_merge_gap") else defaults["vad_merge_gap"],
+            "save_srt": bool(self.check_srt.get()) if hasattr(self, "check_srt") else False,
+        }
+
+    def on_close(self):
+        """Persist current GUI state then destroy the window.
+
+        Save errors are non-fatal: the user closing the app must always be able
+        to close the app, even if the settings file is unwritable.
+        """
+        try:
+            settings_store.save(self._collect_settings_snapshot())
+        except Exception:
+            pass
+        try:
+            if self.is_running:
+                self.core.request_stop()
+        except Exception:
+            pass
+        self.destroy()
 
     def browse_audio(self):
         directory = filedialog.askdirectory()
