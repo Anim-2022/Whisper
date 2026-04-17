@@ -34,31 +34,36 @@ SECTION_INTRO_TITLE_SIZE: int = 18
 LOGO_FONT_SIZE: int = 28
 
 # --------------------------------------------------------------------------
-# Color palette (named, not hex-scattered)
+# Color palette — (light, dark) tuples so customtkinter picks the right
+# shade automatically when set_appearance_mode flips at runtime. The
+# framework resolves the tuple per-widget on every appearance change, so
+# toggling the sidebar theme switch actually repaints backgrounds, not
+# just the text. Accent colors that read the same in both modes (Start
+# green, Stop red, text="black") stay as single hex strings.
 # --------------------------------------------------------------------------
-COLOR_BG: str = "#0E141B"              # main window
-COLOR_SIDEBAR_BG: str = "#111A24"      # left panel
-COLOR_PANEL_BG: str = "#162330"        # settings intro card
-COLOR_PANEL_BORDER: str = "#223445"
-COLOR_ADV_PANEL_BG: str = "#181F28"
-COLOR_ADV_PANEL_BORDER: str = "#2A3C4C"
-COLOR_LOG_PANEL_BG: str = "#161F29"
-COLOR_TAB_BG: str = "#16222F"
-COLOR_TAB_SELECTED: str = "#21425A"
-COLOR_TAB_SELECTED_HOVER: str = "#2B536F"
-COLOR_STEP_BADGE_BG: str = "#203446"
-COLOR_STEP_BADGE_TEXT: str = "#D6E2EB"
+COLOR_BG = ("#ECEFF4", "#0E141B")              # main window
+COLOR_SIDEBAR_BG = ("#DDE4EC", "#111A24")      # left panel
+COLOR_PANEL_BG = ("#F1F4F8", "#162330")        # settings intro card
+COLOR_PANEL_BORDER = ("#C4CDD8", "#223445")
+COLOR_ADV_PANEL_BG = ("#EEF1F5", "#181F28")
+COLOR_ADV_PANEL_BORDER = ("#CBD4DE", "#2A3C4C")
+COLOR_LOG_PANEL_BG = ("#EDF0F4", "#161F29")
+COLOR_TAB_BG = ("#D4DCE5", "#16222F")
+COLOR_TAB_SELECTED = ("#B4C5D6", "#21425A")
+COLOR_TAB_SELECTED_HOVER = ("#9FB3C9", "#2B536F")
+COLOR_STEP_BADGE_BG = ("#CFD8E2", "#203446")
+COLOR_STEP_BADGE_TEXT = ("#1F2933", "#D6E2EB")
 
-COLOR_TEXT_SUBTITLE: str = "#8FA7BA"
-COLOR_TEXT_PRESET_SUMMARY: str = "#A9BBCB"
-COLOR_TEXT_RUNTIME: str = "#70C7E8"
-COLOR_TEXT_HINT: str = "#97ABBC"
-COLOR_TEXT_STATUS: str = "#A6B7C6"
-COLOR_TEXT_HELP: str = "#8EA3B5"
-COLOR_TEXT_INTRO_BODY: str = "#9FB2C5"
-COLOR_TEXT_MODEL_HELP: str = "#6FC5E7"
-COLOR_TEXT_LOCAL_NOTE: str = "#9BB0C4"
-COLOR_TEXT_ADV_INTRO: str = "#D7B16E"  # warning-amber for "advanced = caution"
+COLOR_TEXT_SUBTITLE = ("#5B6A78", "#8FA7BA")
+COLOR_TEXT_PRESET_SUMMARY = ("#475361", "#A9BBCB")
+COLOR_TEXT_RUNTIME = ("#0B6684", "#70C7E8")
+COLOR_TEXT_HINT = ("#5B6A78", "#97ABBC")
+COLOR_TEXT_STATUS = ("#475361", "#A6B7C6")
+COLOR_TEXT_HELP = ("#5F6E7D", "#8EA3B5")
+COLOR_TEXT_INTRO_BODY = ("#475361", "#9FB2C5")
+COLOR_TEXT_MODEL_HELP = ("#0B6684", "#6FC5E7")
+COLOR_TEXT_LOCAL_NOTE = ("#5B6A78", "#9BB0C4")
+COLOR_TEXT_ADV_INTRO = ("#8A6D20", "#D7B16E")  # warning-amber, darker on light
 
 COLOR_BUTTON_START_FG: str = "#2CC985"
 COLOR_BUTTON_START_HOVER: str = "#34D894"

@@ -93,10 +93,16 @@ class ErrorBanner(ctk.CTkFrame):
             self._visible = True
 
     def hide(self) -> None:
-        """Remove the banner from the layout (keeps widget alive for reuse)."""
-        if self._visible:
-            self.grid_remove()
-            self._visible = False
+        """Remove the banner from the layout (keeps widget alive for reuse).
+
+        Unconditional grid_remove — the caller typically does
+        `banner.grid(...); banner.hide()` during construction, when
+        self._visible is still False even though the widget is already
+        shown. The old visibility guard skipped grid_remove in that
+        case and left an empty banner on screen at launch.
+        """
+        self.grid_remove()
+        self._visible = False
 
     def is_visible(self) -> bool:
         return self._visible
