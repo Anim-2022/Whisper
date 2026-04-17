@@ -122,6 +122,12 @@ UI_TEXT: Dict[str, Dict[str, str]] = {
         "model_desc_small": "Faster and lighter, but less accurate on difficult speech or noisy recordings.",
         "model_desc_large": "Highest potential quality, but much heavier. Only use it when the model already exists locally and your hardware can handle it.",
         "model_desc_local_generic": "Local model selected. The app loads it from disk only and does not download anything automatically.",
+        "validation_int_range": "must be an integer in [{lo}, {hi}]",
+        "validation_float_range": "must be a number in [{lo}, {hi}]",
+        "validation_path_empty": "path is empty",
+        "validation_path_missing": "path does not exist: {path}",
+        "validation_failed_title": "Cannot start: invalid input",
+        "validation_failed_intro": "Please fix these fields before starting:",
     },
     "ru": {
         "label_interface_language": "Язык интерфейса",
@@ -225,6 +231,12 @@ UI_TEXT: Dict[str, Dict[str, str]] = {
         "model_desc_small": "Быстрее и легче, но менее точен на сложной речи и шумных записях.",
         "model_desc_large": "Потенциально самое высокое качество, но модель заметно тяжелее. Используйте её только если она уже есть локально и ваше железо справляется.",
         "model_desc_local_generic": "Выбрана локальная модель. Приложение загружает её только с диска и ничего не скачивает автоматически.",
+        "validation_int_range": "должно быть целым числом в [{lo}, {hi}]",
+        "validation_float_range": "должно быть числом в [{lo}, {hi}]",
+        "validation_path_empty": "путь не задан",
+        "validation_path_missing": "путь не существует: {path}",
+        "validation_failed_title": "Невозможно запустить: ошибка в полях",
+        "validation_failed_intro": "Исправьте эти поля перед запуском:",
     },
 }
 

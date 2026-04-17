@@ -45,6 +45,9 @@ class WhisperGUI(ctk.CTk):
         self.preset_keys = list(C.PRESET_KEYS)
         self.decode_profile_keys = list(C.DECODE_PROFILE_KEYS)
         self.localized_help_labels = []
+        # Filled by field_factory.make_labeled_entry whenever a validator is
+        # passed. start_process iterates this list as a pre-flight check.
+        self.validated_entries = []
         self.current_status_raw = "Ready"
         self.has_cuda = torch.cuda.is_available()
         self.has_local_vad = False
@@ -545,6 +548,42 @@ class WhisperGUI(ctk.CTk):
         self.lbl_vad_val.configure(text=f"{float(val):.2f}")
 
     # ------------------------------------------------------------------
+    # Pre-flight validation (Phase D)
+    # ------------------------------------------------------------------
+    def _preflight_validate(self) -> bool:
+        """Return True iff every ValidatedEntry currently holds a valid value.
+
+        On failure: logs each offending field, pops a localized messagebox
+        listing them, and returns False so start_process can abort early.
+        Each entry's red border was already applied by ValidatedEntry on
+        the input event; this method only handles aggregation + reporting.
+        """
+        problems = []
+        for entry in self.validated_entries:
+            if entry.is_valid():
+                continue
+            err = entry.get_error()
+            if err is None:
+                continue  # defensive — shouldn't happen
+            key, kwargs = err
+            label_text = self.t(entry.label_key) if entry.label_key else ""
+            # label_text already ends with a colon (e.g. "Batch size:"), so
+            # we just append a space and the translated reason.
+            problems.append(f"{label_text} {self.t(key, **kwargs)}".strip())
+
+        if not problems:
+            return True
+
+        title = self.t("validation_failed_title")
+        intro = self.t("validation_failed_intro")
+        # Log + dialog so the error is visible no matter which tab is open.
+        self.log(title)
+        for line in problems:
+            self.log(f"  - {line}")
+        messagebox.showerror(title, intro + "\n\n" + "\n".join(problems))
+        return False
+
+    # ------------------------------------------------------------------
     # Settings persistence (Phase B)
     # ------------------------------------------------------------------
     @staticmethod
@@ -773,6 +812,13 @@ class WhisperGUI(ctk.CTk):
 
     def start_process(self):
         if self.is_running:
+            return
+
+        # Pre-flight: every ValidatedEntry registers itself in
+        # self.validated_entries. If any has a current error we refuse to
+        # start, log the offending fields, and pop a dialog summarizing
+        # them so the user does not need to open the Logs tab.
+        if not self._preflight_validate():
             return
 
         if self.combo_device.get() == "cpu":

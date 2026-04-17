@@ -18,6 +18,7 @@ from typing import Callable, Optional, Sequence
 import customtkinter as ctk
 
 from .. import constants as C
+from ..validators import ValidatedEntry
 
 
 def make_help_label(parent, app, row: int, text_key: str,
@@ -57,13 +58,28 @@ def make_field_label(parent, app, row: int, text_key: str):
 
 
 def make_labeled_entry(parent, app, row: int, label_key: str,
-                       help_key: Optional[str], *, default=None):
+                       help_key: Optional[str], *, default=None,
+                       validator: Optional[Callable] = None):
     """Label (col 0) + Entry (col 1), help line on `row + 1`.
+
+    When `validator` is provided the widget is a `ValidatedEntry` that
+    revalidates on every change and is registered into
+    `app.validated_entries` so the pre-flight check in `start_process`
+    can iterate every guarded field.
 
     Returns (label, entry). Help row is auto-created when `help_key` is set.
     """
     label = make_field_label(parent, app, row, label_key)
-    entry = ctk.CTkEntry(parent, height=34)
+    if validator is not None:
+        entry = ValidatedEntry(parent, validator=validator,
+                               label_key=label_key, height=34)
+        # The list is initialized in WhisperGUI.__init__ before tab build,
+        # but be defensive in case a future builder runs in isolation.
+        if not hasattr(app, "validated_entries"):
+            app.validated_entries = []
+        app.validated_entries.append(entry)
+    else:
+        entry = ctk.CTkEntry(parent, height=34)
     entry.grid(row=row, column=1, sticky="ew", padx=10, pady=5)
     if default is not None:
         entry.insert(0, str(default))

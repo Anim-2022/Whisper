@@ -10,6 +10,7 @@ from __future__ import annotations
 import customtkinter as ctk
 
 from .. import constants as C
+from ..validators import IntRangeValidator, FloatRangeValidator
 from .field_factory import (
     make_help_label,
     make_section_header,
@@ -84,6 +85,7 @@ def _build_compute_section(app, parent) -> None:
         parent=parent, app=app, row=6,
         label_key="label_batch_size", help_key="help_batch_size",
         default=C.DEFAULTS["batch_size"],
+        validator=IntRangeValidator(*C.BATCH_SIZE_RANGE),
     )
 
     # VAD checkbox row — uses col 1 for the checkbox and col 2 for the
@@ -152,34 +154,42 @@ def _build_segmentation_section(app, parent) -> None:
     )
     app.set_decode_profile_selection(C.DEFAULTS["decode_profile"])
 
-    # Remaining numeric tunables — all label+entry+help triplets.
+    # Remaining numeric tunables — all label+entry+help triplets, each
+    # guarded by the matching range from gui.constants so a typo can't
+    # silently start a job that crashes inside whisper_core.
     app.target_db_label, app.entry_target_db = make_labeled_entry(
         parent=parent, app=app, row=15,
         label_key="label_target_db", help_key="help_target_db",
         default=C.DEFAULTS["target_db"],
+        validator=FloatRangeValidator(*C.TARGET_DB_RANGE),
     )
     app.merge_gap_label, app.entry_vad_merge_gap = make_labeled_entry(
         parent=parent, app=app, row=17,
         label_key="label_merge_gap", help_key="help_merge_gap",
         default=C.DEFAULTS["vad_merge_gap"],
+        validator=FloatRangeValidator(*C.VAD_MERGE_GAP_SEC_RANGE),
     )
     app.min_silence_label, app.entry_vad_silence = make_labeled_entry(
         parent=parent, app=app, row=19,
         label_key="label_min_silence", help_key="help_min_silence",
         default=C.DEFAULTS["vad_silence_ms"],
+        validator=IntRangeValidator(*C.VAD_MIN_SILENCE_MS_RANGE),
     )
     app.chunk_sec_label, app.entry_chunk_sec = make_labeled_entry(
         parent=parent, app=app, row=21,
         label_key="label_chunk_sec", help_key="help_chunk_sec",
         default=C.DEFAULTS["chunk_sec"],
+        validator=FloatRangeValidator(*C.CHUNK_SEC_RANGE),
     )
     app.overlap_sec_label, app.entry_overlap_sec = make_labeled_entry(
         parent=parent, app=app, row=23,
         label_key="label_overlap_sec", help_key="help_overlap_sec",
         default=C.DEFAULTS["overlap_sec"],
+        validator=FloatRangeValidator(*C.OVERLAP_SEC_RANGE),
     )
     app.max_new_tokens_label, app.entry_max_tokens = make_labeled_entry(
         parent=parent, app=app, row=25,
         label_key="label_max_new_tokens", help_key="help_max_new_tokens",
         default=C.DEFAULTS["max_new_tokens"],
+        validator=IntRangeValidator(*C.MAX_NEW_TOKENS_RANGE),
     )
