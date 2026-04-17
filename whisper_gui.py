@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 from tkinter import filedialog, messagebox
 import customtkinter as ctk
+import os
+import subprocess
 import threading
 import queue
 import statistics
@@ -8,7 +10,7 @@ import sys
 import time
 import torch
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 try:
     from whisper_core import WhisperCore, TranscriptionConfig
@@ -24,6 +26,16 @@ from gui.widgets import settings_tab as settings_tab_builder
 from gui.widgets import advanced_tab as advanced_tab_builder
 from gui.widgets import logs_tab as logs_tab_builder
 from gui.widgets.error_banner import ErrorBanner
+from gui.widgets.preview_dialog import open_preview
+
+# Optional drag-and-drop support. windnd is Windows-only and tiny; if it
+# isn't installed we silently skip D&D wiring rather than fail to start.
+try:
+    import windnd  # type: ignore
+    _HAS_WINDND = True
+except Exception:
+    windnd = None  # type: ignore
+    _HAS_WINDND = False
 
 
 ctk.set_appearance_mode(C.APPEARANCE_MODE)
@@ -63,6 +75,13 @@ class WhisperGUI(ctk.CTk):
         self._completed_durations: List[float] = []
         self.has_cuda = torch.cuda.is_available()
         self.has_local_vad = False
+        # Phase F: post-run "Open folder" / "View result" need to know what was
+        # produced. Updated whenever we see a "Done: <name>" status from core.
+        self.last_output_dir: Optional[Path] = None
+        self.last_result_path: Optional[Path] = None
+        # Widgets that should grey out while a job is running. Filled below as
+        # the sidebar / tabs are built.
+        self._input_widgets: list = []
 
         self.grid_columnconfigure(1, weight=1)
         # row 0 (banner) stays its natural height; row 1 (tabview) takes
@@ -163,6 +182,46 @@ class WhisperGUI(ctk.CTk):
         )
         self.btn_stop.grid(row=9, column=0, padx=20, pady=(0, 14), sticky="ew")
 
+        # Phase F: post-run actions. Disabled until the worker reports a
+        # finished file; enabled by _set_post_run_actions(True).
+        self.btn_open_folder = ctk.CTkButton(
+            self.sidebar_frame,
+            text=self.t("button_open_results"),
+            command=self.open_results_folder,
+            height=32,
+            state="disabled",
+        )
+        self.btn_open_folder.grid(row=14, column=0, padx=20, pady=(0, 6), sticky="ew")
+
+        self.btn_view_result = ctk.CTkButton(
+            self.sidebar_frame,
+            text=self.t("button_view_result"),
+            command=self.preview_latest_result,
+            height=32,
+            state="disabled",
+        )
+        self.btn_view_result.grid(row=15, column=0, padx=20, pady=(0, 12), sticky="ew")
+
+        # Phase F: theme switch (Dark<->Light). Persisted in settings.json.
+        self.theme_label = ctk.CTkLabel(
+            self.sidebar_frame,
+            text=self.t("label_theme"),
+            font=ctk.CTkFont(size=C.HELP_FONT_SIZE, weight="bold"),
+        )
+        self.theme_label.grid(row=16, column=0, padx=20, sticky="w")
+        self.theme_switch = ctk.CTkSwitch(
+            self.sidebar_frame,
+            text=self.t("theme_dark"),
+            command=self._on_theme_switch,
+        )
+        self.theme_switch.grid(row=17, column=0, padx=20, pady=(0, 8), sticky="w")
+        # Default state matches C.APPEARANCE_MODE; _load_persisted_settings
+        # may flip it later.
+        if str(C.APPEARANCE_MODE).lower() == "dark":
+            self.theme_switch.select()
+        else:
+            self.theme_switch.deselect()
+
         self.sidebar_hint_label = ctk.CTkLabel(
             self.sidebar_frame,
             text=self.t("sidebar_hint"),
@@ -172,6 +231,16 @@ class WhisperGUI(ctk.CTk):
             justify="left",
         )
         self.sidebar_hint_label.grid(row=10, column=0, padx=20, pady=(0, 18), sticky="w")
+
+        self.hotkey_hint_label = ctk.CTkLabel(
+            self.sidebar_frame,
+            text=self.t("hotkey_hint"),
+            text_color=C.COLOR_TEXT_HINT,
+            font=ctk.CTkFont(size=C.HELP_FONT_SIZE),
+            wraplength=C.WRAPLENGTH_SIDEBAR,
+            justify="left",
+        )
+        self.hotkey_hint_label.grid(row=18, column=0, padx=20, pady=(8, 14), sticky="w")
 
         self.progress_bar = ctk.CTkProgressBar(self.sidebar_frame, height=12)
         self.progress_bar.grid(row=11, column=0, padx=20, pady=(10, 0), sticky="ew")
@@ -242,6 +311,13 @@ class WhisperGUI(ctk.CTk):
 
         # Persist current values when the user closes the window.
         self.protocol("WM_DELETE_WINDOW", self.on_close)
+
+        # Phase F: hotkeys + drag-and-drop. Bind globally so they work no
+        # matter which tab/widget has focus.
+        self._bind_hotkeys()
+        self._wire_drag_and_drop()
+        # Build the list of widgets to grey out while a job is running.
+        self._collect_input_widgets()
 
         self.after(100, self.process_queues)
 
@@ -355,6 +431,19 @@ class WhisperGUI(ctk.CTk):
         self.btn_start.configure(text=self.t("button_start"))
         self.btn_stop.configure(text=self.t("button_stop"))
         self.sidebar_hint_label.configure(text=self.t("sidebar_hint"))
+        if hasattr(self, "hotkey_hint_label"):
+            self.hotkey_hint_label.configure(text=self.t("hotkey_hint"))
+        if hasattr(self, "btn_open_folder"):
+            self.btn_open_folder.configure(text=self.t("button_open_results"))
+        if hasattr(self, "btn_view_result"):
+            self.btn_view_result.configure(text=self.t("button_view_result"))
+        if hasattr(self, "theme_label"):
+            self.theme_label.configure(text=self.t("label_theme"))
+        if hasattr(self, "theme_switch"):
+            is_dark = bool(self.theme_switch.get())
+            self.theme_switch.configure(
+                text=self.t("theme_dark" if is_dark else "theme_light")
+            )
 
         self.settings_intro_title_label.configure(text=self.t("settings_intro_title"))
         self.settings_intro_body_label.configure(text=self.t("settings_intro_body"))
@@ -568,6 +657,172 @@ class WhisperGUI(ctk.CTk):
         self.lbl_vad_val.configure(text=f"{float(val):.2f}")
 
     # ------------------------------------------------------------------
+    # Phase F: hotkeys, drag&drop, theme, post-run actions, input lock
+    # ------------------------------------------------------------------
+    def _bind_hotkeys(self) -> None:
+        """Wire up F5 / Esc / Ctrl+O / Ctrl+L / Ctrl+Q at the root level.
+
+        We use bind_all so hotkeys still fire when focus is inside an Entry
+        or the log textbox. Each binding short-circuits with a no-op if the
+        action is invalid for the current state (e.g. F5 while a job runs).
+        """
+        self.bind_all("<F5>", lambda _e: self._hotkey_start())
+        self.bind_all("<Escape>", lambda _e: self._hotkey_stop())
+        self.bind_all("<Control-o>", lambda _e: self._hotkey_browse_audio())
+        self.bind_all("<Control-O>", lambda _e: self._hotkey_browse_audio())
+        self.bind_all("<Control-l>", lambda _e: self._hotkey_focus_logs())
+        self.bind_all("<Control-L>", lambda _e: self._hotkey_focus_logs())
+        self.bind_all("<Control-q>", lambda _e: self.on_close())
+        self.bind_all("<Control-Q>", lambda _e: self.on_close())
+
+    def _hotkey_start(self) -> None:
+        if not self.is_running:
+            self.start_process()
+
+    def _hotkey_stop(self) -> None:
+        if self.is_running:
+            self.stop_process()
+
+    def _hotkey_browse_audio(self) -> None:
+        if not self.is_running:
+            self.browse_audio()
+
+    def _hotkey_focus_logs(self) -> None:
+        try:
+            self.tabview.set(self.tab_names["logs"])
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    def _wire_drag_and_drop(self) -> None:
+        """Hook windnd onto the audio entry if the optional dep is present.
+
+        Drop semantics: a directory becomes the new audio folder; a file's
+        parent directory becomes the new audio folder. We never copy files —
+        the worker scans the folder anyway.
+        """
+        if not _HAS_WINDND or windnd is None or not hasattr(self, "entry_audio"):
+            return
+        try:
+            windnd.hook_dropfiles(self.entry_audio, func=self._on_drop_files)
+        except Exception:
+            pass  # best-effort; D&D is a nice-to-have
+
+    def _on_drop_files(self, files) -> None:
+        if not files:
+            return
+        # windnd hands us bytes on Windows — decode with the active code page
+        # then fall back to utf-8 with replacement.
+        first = files[0]
+        if isinstance(first, bytes):
+            try:
+                first = first.decode("mbcs")
+            except Exception:
+                first = first.decode("utf-8", errors="replace")
+        path = Path(first)
+        target = path if path.is_dir() else path.parent
+        try:
+            self.entry_audio.delete(0, "end")
+            self.entry_audio.insert(0, str(target))
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    def _on_theme_switch(self) -> None:
+        """Switch customtkinter appearance mode and update the switch label."""
+        is_dark = bool(self.theme_switch.get())
+        mode = "Dark" if is_dark else "Light"
+        try:
+            ctk.set_appearance_mode(mode)
+        except Exception:
+            pass
+        self.theme_switch.configure(
+            text=self.t("theme_dark" if is_dark else "theme_light")
+        )
+
+    # ------------------------------------------------------------------
+    def _collect_input_widgets(self) -> None:
+        """Snapshot widgets that should grey out during a run.
+
+        Keeping this as an explicit list avoids an introspection walk every
+        time we toggle, and we deliberately exclude btn_start / btn_stop /
+        progress / banner / theme switch — those have their own state.
+        """
+        names = [
+            "entry_audio", "btn_browse_audio",
+            "entry_output", "btn_browse_output",
+            "combo_model", "btn_refresh_models", "btn_model_folder",
+            "combo_lang", "check_auto_lang",
+            "combo_preset", "combo_ui_lang",
+            "combo_device", "combo_dtype",
+            "entry_batch", "check_vad", "slider_vad", "combo_decode",
+            "entry_target_db", "entry_vad_merge_gap", "entry_vad_silence",
+            "entry_chunk_sec", "entry_overlap_sec", "entry_max_tokens",
+            "check_srt",
+        ]
+        self._input_widgets = [getattr(self, n) for n in names if hasattr(self, n)]
+
+    def _set_inputs_state(self, enabled: bool) -> None:
+        """Enable/disable every collected input. Defensive: per-widget try."""
+        state = "normal" if enabled else "disabled"
+        for widget in self._input_widgets:
+            try:
+                widget.configure(state=state)
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------
+    def _set_post_run_actions(self, enabled: bool) -> None:
+        """Light up the 'Open folder' and 'View result' buttons after a run."""
+        state = "normal" if enabled else "disabled"
+        if hasattr(self, "btn_open_folder"):
+            self.btn_open_folder.configure(state=state)
+        if hasattr(self, "btn_view_result"):
+            # 'View result' only makes sense when we actually have a file.
+            view_state = state if (enabled and self.last_result_path) else "disabled"
+            self.btn_view_result.configure(state=view_state)
+
+    def _track_finished_file(self, audio_name: str) -> None:
+        """Compute the .txt path the core just wrote and remember it.
+
+        whisper_core writes <stem>.txt to cfg.output_dir; we mirror that.
+        """
+        try:
+            output_dir = Path(self.entry_output.get().strip())
+        except Exception:
+            return
+        if not output_dir or str(output_dir) == ".":
+            return
+        self.last_output_dir = output_dir
+        candidate = output_dir / f"{Path(audio_name).stem}.txt"
+        if candidate.exists():
+            self.last_result_path = candidate
+
+    def open_results_folder(self) -> None:
+        """Open the configured output folder in the OS file manager."""
+        target = self.last_output_dir or Path(self.entry_output.get().strip() or ".")
+        try:
+            if not target.exists():
+                target.mkdir(parents=True, exist_ok=True)
+            if sys.platform == "win32":
+                os.startfile(str(target))  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(target)])
+            else:
+                subprocess.Popen(["xdg-open", str(target)])
+        except Exception as e:
+            self.error_banner.show(
+                self.t("banner_open_folder_failed", error=e), level="error",
+            )
+
+    def preview_latest_result(self) -> None:
+        """Spawn a PreviewDialog for the most recently finished transcript."""
+        if not self.last_result_path or not self.last_result_path.exists():
+            self.error_banner.show(self.t("banner_no_results_yet"), level="warn")
+            return
+        open_preview(self, self.last_result_path, self.t)
+
+    # ------------------------------------------------------------------
     # Per-file progress + ETA (Phase E)
     # ------------------------------------------------------------------
     def _reset_file_progress(self) -> None:
@@ -637,6 +892,9 @@ class WhisperGUI(ctk.CTk):
                 self._note_file_started(name)
         elif stripped.startswith("Done: "):
             self._note_file_done()
+            # Phase F: remember the .txt the core just produced so the
+            # post-run "View result" button has something to open.
+            self._track_finished_file(stripped[len("Done: "):])
 
         # Translate the base status using the existing translator.
         base = self.translate_status(status)
@@ -821,6 +1079,22 @@ class WhisperGUI(ctk.CTk):
             else:
                 self.check_srt.deselect()
 
+        # Phase F: appearance mode (Dark/Light). Apply via customtkinter and
+        # sync the sidebar switch so its label matches the live state.
+        appearance = s.get("appearance_mode")
+        if isinstance(appearance, str) and appearance.lower() in ("dark", "light"):
+            try:
+                ctk.set_appearance_mode(appearance)
+            except Exception:
+                pass
+            if hasattr(self, "theme_switch"):
+                if appearance.lower() == "dark":
+                    self.theme_switch.select()
+                    self.theme_switch.configure(text=self.t("theme_dark"))
+                else:
+                    self.theme_switch.deselect()
+                    self.theme_switch.configure(text=self.t("theme_light"))
+
         # Reflect any device/model/lang change in the runtime summary text.
         self.refresh_runtime_summary()
 
@@ -854,6 +1128,10 @@ class WhisperGUI(ctk.CTk):
             "vad_silence_ms": self._safe_int(self.entry_vad_silence.get(), defaults["vad_silence_ms"]) if hasattr(self, "entry_vad_silence") else defaults["vad_silence_ms"],
             "vad_merge_gap": self._safe_float(self.entry_vad_merge_gap.get(), defaults["vad_merge_gap"]) if hasattr(self, "entry_vad_merge_gap") else defaults["vad_merge_gap"],
             "save_srt": bool(self.check_srt.get()) if hasattr(self, "check_srt") else False,
+            "appearance_mode": (
+                "Dark" if (hasattr(self, "theme_switch") and self.theme_switch.get())
+                else "Light"
+            ) if hasattr(self, "theme_switch") else C.APPEARANCE_MODE,
         }
 
     def on_close(self):
@@ -919,6 +1197,10 @@ class WhisperGUI(ctk.CTk):
                 self.btn_start.configure(state="normal")
                 self.btn_stop.configure(state="disabled")
                 self.is_running = False
+                # Phase F: re-enable inputs and (if a transcript landed)
+                # light up the post-run actions.
+                self._set_inputs_state(True)
+                self._set_post_run_actions(True)
                 if status == "Done":
                     self.lbl_percentage.configure(text="100%")
 
@@ -1010,6 +1292,11 @@ class WhisperGUI(ctk.CTk):
         self.btn_start.configure(state="disabled")
         self.btn_stop.configure(state="normal")
         self.progress_bar.set(0)
+        # Phase F: lock inputs and clear stale post-run state so the
+        # "View result" button doesn't open the previous run's file.
+        self._set_inputs_state(False)
+        self.last_result_path = None
+        self._set_post_run_actions(False)
 
         worker = threading.Thread(target=self.run_thread, args=(cfg,))
         worker.daemon = True
