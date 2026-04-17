@@ -3,7 +3,9 @@ from tkinter import filedialog, messagebox
 import customtkinter as ctk
 import threading
 import queue
+import statistics
 import sys
+import time
 import torch
 from pathlib import Path
 from typing import List
@@ -21,6 +23,7 @@ from gui.i18n import UI_TEXT
 from gui.widgets import settings_tab as settings_tab_builder
 from gui.widgets import advanced_tab as advanced_tab_builder
 from gui.widgets import logs_tab as logs_tab_builder
+from gui.widgets.error_banner import ErrorBanner
 
 
 ctk.set_appearance_mode(C.APPEARANCE_MODE)
@@ -39,6 +42,9 @@ class WhisperGUI(ctk.CTk):
         self.core = WhisperCore(on_log=self.on_core_log, on_progress=self.on_core_progress)
         self.log_queue = queue.Queue()
         self.progress_queue = queue.Queue()
+        # Banner messages enqueued from the worker thread; drained on the
+        # Tk main thread inside process_queues. Items: (level, message).
+        self.banner_queue: "queue.Queue[tuple[str, str]]" = queue.Queue()
         self.is_running = False
         self.files_to_process: List[Path] = []
         self.ui_language = C.DEFAULT_UI_LANGUAGE
@@ -49,16 +55,24 @@ class WhisperGUI(ctk.CTk):
         # passed. start_process iterates this list as a pre-flight check.
         self.validated_entries = []
         self.current_status_raw = "Ready"
+        # Per-file progress tracking (Phase E). Reset on each start_process.
+        self.files_total = 0
+        self.current_file_index = 0
+        self.current_file_name = ""
+        self._file_started_at = 0.0
+        self._completed_durations: List[float] = []
         self.has_cuda = torch.cuda.is_available()
         self.has_local_vad = False
 
         self.grid_columnconfigure(1, weight=1)
-        self.grid_rowconfigure(0, weight=1)
+        # row 0 (banner) stays its natural height; row 1 (tabview) takes
+        # all remaining vertical space. The sidebar spans both rows.
+        self.grid_rowconfigure(1, weight=1)
 
         self.sidebar_frame = ctk.CTkFrame(
             self, width=C.SIDEBAR_WIDTH, corner_radius=0, fg_color=C.COLOR_SIDEBAR_BG,
         )
-        self.sidebar_frame.grid(row=0, column=0, sticky="nsew")
+        self.sidebar_frame.grid(row=0, column=0, rowspan=2, sticky="nsew")
         self.sidebar_frame.grid_rowconfigure(10, weight=1)
 
         self.logo_label = ctk.CTkLabel(
@@ -186,7 +200,13 @@ class WhisperGUI(ctk.CTk):
             segmented_button_selected_color=C.COLOR_TAB_SELECTED,
             segmented_button_selected_hover_color=C.COLOR_TAB_SELECTED_HOVER,
         )
-        self.tabview.grid(row=0, column=1, padx=20, pady=20, sticky="nsew")
+        # Error/warning banner sits above the tabview so problems are
+        # visible no matter which tab is open. Hidden until show() is called.
+        self.error_banner = ErrorBanner(self)
+        self.error_banner.grid(row=0, column=1, padx=20, pady=(20, 0), sticky="ew")
+        self.error_banner.hide()
+
+        self.tabview.grid(row=1, column=1, padx=20, pady=20, sticky="nsew")
 
         self.tab_names = {
             "settings": self.t("tab_settings"),
@@ -548,6 +568,96 @@ class WhisperGUI(ctk.CTk):
         self.lbl_vad_val.configure(text=f"{float(val):.2f}")
 
     # ------------------------------------------------------------------
+    # Per-file progress + ETA (Phase E)
+    # ------------------------------------------------------------------
+    def _reset_file_progress(self) -> None:
+        """Clear the tracker; called at the top of every start_process."""
+        self.files_total = 0
+        self.current_file_index = 0
+        self.current_file_name = ""
+        self._file_started_at = 0.0
+        self._completed_durations = []
+
+    def _note_file_started(self, name: str) -> None:
+        """Mark `name` as the currently-processing file and start its timer."""
+        self.current_file_index += 1
+        self.current_file_name = name
+        self._file_started_at = time.monotonic()
+
+    def _note_file_done(self) -> None:
+        """Record elapsed time for the just-finished file (used for ETA)."""
+        if self._file_started_at:
+            elapsed = time.monotonic() - self._file_started_at
+            if elapsed > 0:
+                self._completed_durations.append(elapsed)
+        self._file_started_at = 0.0
+
+    def _estimate_eta_seconds(self) -> float:
+        """Median of completed durations × remaining files. 0 if unknown."""
+        if not self._completed_durations or self.files_total == 0:
+            return 0.0
+        remaining = max(0, self.files_total - self.current_file_index)
+        if remaining == 0:
+            return 0.0
+        per_file = statistics.median(self._completed_durations)
+        return per_file * remaining
+
+    @staticmethod
+    def _format_eta(seconds: float) -> str:
+        """Format `seconds` as 'm:ss' (or 'h:mm:ss' for runs over an hour)."""
+        if seconds <= 0:
+            return ""
+        total = int(round(seconds))
+        if total >= 3600:
+            h, rem = divmod(total, 3600)
+            m, s = divmod(rem, 60)
+            return f"{h}:{m:02d}:{s:02d}"
+        m, s = divmod(total, 60)
+        return f"{m}:{s:02d}"
+
+    def _format_status_for_display(self, status: str) -> str:
+        """Translate a raw core status to a localized display string.
+
+        Side-effect: updates per-file tracking when the status indicates a
+        file boundary so the resulting text can include 'File N/M: name'
+        plus an ETA estimate.
+        """
+        stripped = status.strip()
+
+        # File-boundary statuses come from whisper_core: 'Processing X...',
+        # 'Pipeline: X', 'Done: X'. Update the tracker before formatting.
+        if stripped.startswith("Processing ") and stripped.endswith("..."):
+            name = stripped[len("Processing "):-3]
+            self._note_file_started(name)
+        elif stripped.startswith("Pipeline: "):
+            name = stripped[len("Pipeline: "):]
+            # Only count once per file: Pipeline often comes right after
+            # the matching Processing, so don't double-increment.
+            if name != self.current_file_name:
+                self._note_file_started(name)
+        elif stripped.startswith("Done: "):
+            self._note_file_done()
+
+        # Translate the base status using the existing translator.
+        base = self.translate_status(status)
+
+        # Only decorate with file counter while a job is in flight.
+        if self.is_running and self.files_total > 0 and self.current_file_index > 0:
+            file_line = self.t(
+                "progress_file_line",
+                idx=self.current_file_index,
+                total=self.files_total,
+                name=self.current_file_name or "",
+            )
+            eta_secs = self._estimate_eta_seconds()
+            if eta_secs > 0:
+                eta_text = self.t("progress_eta", eta=self._format_eta(eta_secs))
+                return f"{file_line}\n{base} — {eta_text}"
+            return f"{file_line}\n{base}"
+
+        return base
+
+    # ------------------------------------------------------------------
     # Pre-flight validation (Phase D)
     # ------------------------------------------------------------------
     def _preflight_validate(self) -> bool:
@@ -575,12 +685,12 @@ class WhisperGUI(ctk.CTk):
             return True
 
         title = self.t("validation_failed_title")
-        intro = self.t("validation_failed_intro")
-        # Log + dialog so the error is visible no matter which tab is open.
+        intro = self.t("banner_validation_intro")
+        # Log + banner so the error is visible no matter which tab is open.
         self.log(title)
         for line in problems:
             self.log(f"  - {line}")
-        messagebox.showerror(title, intro + "\n\n" + "\n".join(problems))
+        self.error_banner.show(intro + "\n  " + "\n  ".join(problems), level="error")
         return False
 
     # ------------------------------------------------------------------
@@ -799,7 +909,11 @@ class WhisperGUI(ctk.CTk):
             self.current_status_raw = status
             self.progress_bar.set(percent)
             self.lbl_percentage.configure(text=f"{int(percent * 100)}%")
-            self.status_label.configure(text=self.translate_status(status))
+            # Per-file tracker watches every status; the returned text already
+            # includes "File N/M: name" + ETA when those make sense, so the
+            # status label can just show it directly.
+            display_text = self._format_status_for_display(status)
+            self.status_label.configure(text=display_text)
 
             if status == "Done" or "Stopped" in status or "Error" in status:
                 self.btn_start.configure(state="normal")
@@ -808,16 +922,25 @@ class WhisperGUI(ctk.CTk):
                 if status == "Done":
                     self.lbl_percentage.configure(text="100%")
 
+        # Banner messages from background threads. Drained on Tk thread.
+        while not self.banner_queue.empty():
+            level, message = self.banner_queue.get()
+            self.error_banner.show(message, level=level)
+
         self.after(100, self.process_queues)
 
     def start_process(self):
         if self.is_running:
             return
 
+        # Every new run starts with a clean banner and a zeroed per-file
+        # tracker; the old tracker would show stale ETA.
+        self.error_banner.hide()
+        self._reset_file_progress()
+
         # Pre-flight: every ValidatedEntry registers itself in
         # self.validated_entries. If any has a current error we refuse to
-        # start, log the offending fields, and pop a dialog summarizing
-        # them so the user does not need to open the Logs tab.
+        # start, log the offending fields, and surface them on the banner.
         if not self._preflight_validate():
             return
 
@@ -829,6 +952,9 @@ class WhisperGUI(ctk.CTk):
             if not response:
                 return
 
+        # The whole config-build + file-scan block is wrapped so any
+        # unexpected exception (bad output_dir path characters, read-only
+        # folder, etc.) lands on the banner instead of dying silently.
         try:
             cfg = TranscriptionConfig(
                 model_path=self.combo_model.get().strip(),
@@ -849,13 +975,18 @@ class WhisperGUI(ctk.CTk):
                 save_srt=bool(self.check_srt.get()),
                 output_dir=Path(self.entry_output.get().strip()),
             )
-        except ValueError as e:
+        except (ValueError, OSError) as e:
             self.log(self.t("log_config_error", error=e))
+            self.error_banner.show(self.t("banner_start_failed", error=e), level="error")
             return
 
         audio_dir = Path(self.entry_audio.get().strip())
         if not audio_dir.exists():
-            self.log(self.t("log_audio_folder_not_found", path=audio_dir))
+            msg = self.t("log_audio_folder_not_found", path=audio_dir)
+            self.log(msg)
+            self.error_banner.show(
+                self.t("banner_audio_dir_missing", path=audio_dir), level="error",
+            )
             return
 
         self.files_to_process = []
@@ -864,11 +995,17 @@ class WhisperGUI(ctk.CTk):
 
         if not self.files_to_process:
             self.log(self.t("log_no_audio_files"))
+            self.error_banner.show(
+                self.t("banner_no_audio_files", path=audio_dir), level="warn",
+            )
             return
 
         self.files_to_process = sorted(self.files_to_process)
         self.log(self.t("log_found_files", count=len(self.files_to_process)))
 
+        # Arm per-file progress tracking before the worker thread starts
+        # so the first "Processing ..." status already knows the total.
+        self.files_total = len(self.files_to_process)
         self.is_running = True
         self.btn_start.configure(state="disabled")
         self.btn_stop.configure(state="normal")
@@ -882,7 +1019,12 @@ class WhisperGUI(ctk.CTk):
         try:
             self.core.process_files(self.files_to_process, cfg)
         except Exception as e:
+            # Worker thread cannot touch Tk widgets directly; route the
+            # banner update through the Tk-thread-drained banner_queue.
             self.on_core_log(self.t("log_critical_worker_error", error=e))
+            self.banner_queue.put(
+                ("error", self.t("banner_worker_crashed", error=e))
+            )
             self.on_core_progress(0, "Error")
 
     def stop_process(self):
