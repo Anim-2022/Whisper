@@ -28,7 +28,6 @@
 - **Error banner & per-file ETA** — problems and "File 2/5 — ETA 0:42" are surfaced above the tabs, no need to open the Logs tab
 - **Hotkeys** — `F5` start, `Esc` stop, `Ctrl+O` audio folder, `Ctrl+L` logs tab, `Ctrl+Q` quit
 - **Result preview & quick open** — sidebar buttons to open the output folder or read the latest transcript in a popup (copy / save-as)
-- **Light / Dark theme** — toggleable from the sidebar, choice is persisted
 - **Drag & drop** (optional) — install `windnd` and drop a file or folder onto the audio path
 - **WER / CER evaluation** — built-in script to measure transcription quality
 

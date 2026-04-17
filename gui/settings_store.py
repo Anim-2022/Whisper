@@ -74,8 +74,6 @@ def _build_defaults() -> Dict[str, Any]:
         "vad_merge_gap": fast["vad_merge_gap"],
         # Output
         "save_srt": False,
-        # Appearance (Phase F): "Dark" | "Light" | "System"
-        "appearance_mode": C.APPEARANCE_MODE,
     }
 
 

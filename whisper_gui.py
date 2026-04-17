@@ -202,26 +202,6 @@ class WhisperGUI(ctk.CTk):
         )
         self.btn_view_result.grid(row=15, column=0, padx=20, pady=(0, 12), sticky="ew")
 
-        # Phase F: theme switch (Dark<->Light). Persisted in settings.json.
-        self.theme_label = ctk.CTkLabel(
-            self.sidebar_frame,
-            text=self.t("label_theme"),
-            font=ctk.CTkFont(size=C.HELP_FONT_SIZE, weight="bold"),
-        )
-        self.theme_label.grid(row=16, column=0, padx=20, sticky="w")
-        self.theme_switch = ctk.CTkSwitch(
-            self.sidebar_frame,
-            text=self.t("theme_dark"),
-            command=self._on_theme_switch,
-        )
-        self.theme_switch.grid(row=17, column=0, padx=20, pady=(0, 8), sticky="w")
-        # Default state matches C.APPEARANCE_MODE; _load_persisted_settings
-        # may flip it later.
-        if str(C.APPEARANCE_MODE).lower() == "dark":
-            self.theme_switch.select()
-        else:
-            self.theme_switch.deselect()
-
         self.sidebar_hint_label = ctk.CTkLabel(
             self.sidebar_frame,
             text=self.t("sidebar_hint"),
@@ -240,7 +220,7 @@ class WhisperGUI(ctk.CTk):
             wraplength=C.WRAPLENGTH_SIDEBAR,
             justify="left",
         )
-        self.hotkey_hint_label.grid(row=18, column=0, padx=20, pady=(8, 14), sticky="w")
+        self.hotkey_hint_label.grid(row=16, column=0, padx=20, pady=(8, 14), sticky="w")
 
         self.progress_bar = ctk.CTkProgressBar(self.sidebar_frame, height=12)
         self.progress_bar.grid(row=11, column=0, padx=20, pady=(10, 0), sticky="ew")
@@ -437,13 +417,6 @@ class WhisperGUI(ctk.CTk):
             self.btn_open_folder.configure(text=self.t("button_open_results"))
         if hasattr(self, "btn_view_result"):
             self.btn_view_result.configure(text=self.t("button_view_result"))
-        if hasattr(self, "theme_label"):
-            self.theme_label.configure(text=self.t("label_theme"))
-        if hasattr(self, "theme_switch"):
-            is_dark = bool(self.theme_switch.get())
-            self.theme_switch.configure(
-                text=self.t("theme_dark" if is_dark else "theme_light")
-            )
 
         self.settings_intro_title_label.configure(text=self.t("settings_intro_title"))
         self.settings_intro_body_label.configure(text=self.t("settings_intro_body"))
@@ -726,19 +699,6 @@ class WhisperGUI(ctk.CTk):
             self.entry_audio.insert(0, str(target))
         except Exception:
             pass
-
-    # ------------------------------------------------------------------
-    def _on_theme_switch(self) -> None:
-        """Switch customtkinter appearance mode and update the switch label."""
-        is_dark = bool(self.theme_switch.get())
-        mode = "Dark" if is_dark else "Light"
-        try:
-            ctk.set_appearance_mode(mode)
-        except Exception:
-            pass
-        self.theme_switch.configure(
-            text=self.t("theme_dark" if is_dark else "theme_light")
-        )
 
     # ------------------------------------------------------------------
     def _collect_input_widgets(self) -> None:
@@ -1079,22 +1039,6 @@ class WhisperGUI(ctk.CTk):
             else:
                 self.check_srt.deselect()
 
-        # Phase F: appearance mode (Dark/Light). Apply via customtkinter and
-        # sync the sidebar switch so its label matches the live state.
-        appearance = s.get("appearance_mode")
-        if isinstance(appearance, str) and appearance.lower() in ("dark", "light"):
-            try:
-                ctk.set_appearance_mode(appearance)
-            except Exception:
-                pass
-            if hasattr(self, "theme_switch"):
-                if appearance.lower() == "dark":
-                    self.theme_switch.select()
-                    self.theme_switch.configure(text=self.t("theme_dark"))
-                else:
-                    self.theme_switch.deselect()
-                    self.theme_switch.configure(text=self.t("theme_light"))
-
         # Reflect any device/model/lang change in the runtime summary text.
         self.refresh_runtime_summary()
 
@@ -1128,10 +1072,6 @@ class WhisperGUI(ctk.CTk):
             "vad_silence_ms": self._safe_int(self.entry_vad_silence.get(), defaults["vad_silence_ms"]) if hasattr(self, "entry_vad_silence") else defaults["vad_silence_ms"],
             "vad_merge_gap": self._safe_float(self.entry_vad_merge_gap.get(), defaults["vad_merge_gap"]) if hasattr(self, "entry_vad_merge_gap") else defaults["vad_merge_gap"],
             "save_srt": bool(self.check_srt.get()) if hasattr(self, "check_srt") else False,
-            "appearance_mode": (
-                "Dark" if (hasattr(self, "theme_switch") and self.theme_switch.get())
-                else "Light"
-            ) if hasattr(self, "theme_switch") else C.APPEARANCE_MODE,
         }
 
     def on_close(self):
