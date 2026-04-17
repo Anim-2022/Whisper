@@ -22,7 +22,22 @@ import soundfile as sf
 # VAD: using Silero via torch.hub (no compilation needed)
 HAS_VAD = True
 
-from transformers import WhisperProcessor, WhisperForConditionalGeneration
+from transformers import WhisperProcessor, WhisperForConditionalGeneration, pipeline
+
+
+def _fmt_srt_time(sec: float) -> str:
+    """SRT timestamp format: HH:MM:SS,mmm (always 3-digit ms, comma separator)."""
+    if sec is None or sec < 0:
+        sec = 0.0
+    ms = int(round((sec - int(sec)) * 1000))
+    if ms == 1000:
+        ms = 0
+        sec_int = int(sec) + 1
+    else:
+        sec_int = int(sec)
+    m, s_ = divmod(sec_int, 60)
+    h, m = divmod(m, 60)
+    return f"{h:02d}:{m:02d}:{s_:02d},{ms:03d}"
 
 # -----------------------------------------------------------------------------
 # Configuration
@@ -49,11 +64,34 @@ class TranscriptionConfig:
     
     # Model / Compute
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    dtype: str = "float16" # "float16" or "float32"
+    # "auto" picks bf16 on Ampere+ (cc>=8.0), fp16 on older CUDA, fp32 on CPU.
+    # Explicit values: "float16" | "bfloat16" | "float32".
+    dtype: str = "auto"
     batch_size: int = 4
-    max_new_tokens: int = 225
+    # Whisper hard-caps total context at 448 tokens (incl. prompt/lang/task).
+    # For 20-28 s chunks of normal-density speech, real token counts rarely exceed
+    # ~100; budget=128 leaves headroom without spending decode time on padding.
+    # For very dense speech / hard chunks bump to 200-224 in GUI.
+    max_new_tokens: int = 128
     decode_profile: Literal["balanced", "quality"] = "balanced"
     target_db: float = -20.0
+    # Compile model.forward with torch.compile. Adds ~30-60s warmup on the first
+    # batch but yields +10-25% throughput on Ampere/Ada with SDPA. Off by default
+    # because recompiles on shape changes can spam logs.
+    use_compile: bool = False
+    # Use HF transformers' built-in long-form ASR pipeline instead of the manual
+    # VAD->chunk->batch->stitch loop. The pipeline packs short segments into 30 s
+    # mel windows (so the encoder isn't wasted on padding), uses Whisper-aware
+    # token-level stitching with timestamps, and handles language/task internally.
+    # Off by default for rollback safety; enable once validated on your corpus.
+    use_hf_pipeline: bool = False
+    # Stride (seconds) on each side of the 30 s pipeline window. 5 s is the HF
+    # default and matches Whisper's training stride.
+    pipeline_stride_sec: float = 5.0
+    # Peak amplitude threshold below which a chunk is considered silent and
+    # skipped by the manual-path batch loop (to avoid Whisper hallucinations
+    # on near-silence). 0.005 ~ -46 dBFS after normalization.
+    silence_amplitude_threshold: float = 0.005
     
     # Output
     save_srt: bool = False
@@ -63,9 +101,22 @@ class TranscriptionConfig:
         # Auto-adjust device/dtype
         if self.device == "cuda" and not torch.cuda.is_available():
             self.device = "cpu"
-        
+
         if self.device == "cpu":
+            # bf16/fp16 inference is unstable/slow on CPU for Whisper; force fp32.
             self.dtype = "float32"
+        elif self.dtype == "auto":
+            # Prefer bf16 on Ampere+ (compute capability 8.0+): same speed as fp16,
+            # much wider exponent range -> no NaNs in encoder LayerNorms on noisy
+            # audio. Fall back to fp16 on Turing/Volta and older.
+            try:
+                major, _ = torch.cuda.get_device_capability()
+            except Exception:
+                major = 0
+            self.dtype = "bfloat16" if major >= 8 else "float16"
+
+        if self.dtype not in {"float16", "bfloat16", "float32"}:
+            raise ValueError(f"dtype must be one of float16/bfloat16/float32/auto, got {self.dtype!r}")
 
         if self.chunk_sec <= 0:
             raise ValueError("chunk_sec must be positive")
@@ -86,7 +137,11 @@ class TranscriptionConfig:
 
     @property
     def torch_dtype(self):
-        return torch.float16 if self.dtype == "float16" else torch.float32
+        return {
+            "float16":  torch.float16,
+            "bfloat16": torch.bfloat16,
+            "float32":  torch.float32,
+        }[self.dtype]
 
 # -----------------------------------------------------------------------------
 # Core Engine Class
@@ -105,12 +160,13 @@ class WhisperCore:
         self.stop_requested = False
         self.processor = None
         self.model = None
-        
+        # HF asr pipeline (lazily built on first use when config.use_hf_pipeline=True)
+        self.asr_pipeline = None
+
         # VAD
         self.vad_model = None
         self.vad_utils = None
-        self.supports_attention_mask = True
-        
+
         self.current_config = None
         
         # Internal cache for faster subsequent loads or checks
@@ -226,34 +282,109 @@ class WhisperCore:
             )
             
             self.log("Step 2/2: Loading weights (this may take a moment)...")
-            
-            # Check for accelerate for better loading
+
+            # Pick best attention implementation: FA2 if installed, otherwise SDPA
+            # (built into torch>=2.0). Falls back to "eager" if the runtime rejects
+            # the chosen impl on this model/dtype combo.
+            attn_impl = "sdpa"
+            if config.device != "cpu" and config.dtype in ("float16", "bfloat16"):
+                try:
+                    import flash_attn  # noqa: F401
+                    attn_impl = "flash_attention_2"
+                except ImportError:
+                    pass
+
+            # device_map="auto" is only useful for multi-GPU or CPU offload of large
+            # models. On a single GPU it adds accelerate hooks that block plain .to()
+            # movement and can spuriously offload layers. Restrict accordingly.
+            multi_gpu = (
+                config.device != "cpu"
+                and torch.cuda.is_available()
+                and torch.cuda.device_count() > 1
+            )
             has_accelerate = False
-            try:
-                import accelerate
-                has_accelerate = True
-            except ImportError:
-                pass
+            if multi_gpu:
+                try:
+                    import accelerate  # noqa: F401
+                    has_accelerate = True
+                except ImportError:
+                    pass
 
             load_kwargs = {
                 "torch_dtype": config.torch_dtype,
                 "low_cpu_mem_usage": True,
                 "local_files_only": True,
+                "attn_implementation": attn_impl,
             }
-            if has_accelerate and config.device != "cpu":
+            if has_accelerate and multi_gpu:
                 load_kwargs["device_map"] = "auto"
 
-            self.model = WhisperForConditionalGeneration.from_pretrained(
-                str(resolved_model_path),
-                **load_kwargs
-            )
-            
-            # If not using device_map, manually move to device
+            try:
+                self.model = WhisperForConditionalGeneration.from_pretrained(
+                    str(resolved_model_path),
+                    **load_kwargs,
+                )
+                self.log(f"Attention implementation: {attn_impl}")
+            except (ValueError, ImportError, RuntimeError) as e:
+                # FA2/SDPA may be unavailable for some model+dtype combos; fall back.
+                if attn_impl != "eager":
+                    self.log(f"attn_implementation={attn_impl!r} failed ({e}); retrying with 'eager'.")
+                    load_kwargs["attn_implementation"] = "eager"
+                    self.model = WhisperForConditionalGeneration.from_pretrained(
+                        str(resolved_model_path),
+                        **load_kwargs,
+                    )
+                else:
+                    raise
+
+            # If not using device_map, manually move to device.
             if "device_map" not in load_kwargs:
                 self.log(f"Moving model to {config.device}...")
                 self.model = self.model.to(config.device)
-                
+
             self.model.eval()
+
+            # Optional torch.compile pass. Wrap model.forward, not the whole module —
+            # generate() has Python-side control flow that defeats fullgraph=True.
+            # mode='reduce-overhead' targets the per-step decoder forward, which is
+            # what we re-enter on every generated token.
+            #
+            # The default Inductor backend requires Triton, which is not packaged
+            # with PyTorch on Windows. Silently skip compile when Triton is missing
+            # rather than crashing on the first forward pass.
+            if config.use_compile and config.device != "cpu" and hasattr(torch, "compile"):
+                try:
+                    import triton  # noqa: F401
+                    triton_ok = True
+                except ImportError:
+                    triton_ok = False
+
+                if not triton_ok:
+                    self.log("torch.compile requested but Triton is not installed "
+                             "(install 'triton' wheel for Windows). Skipping compile.")
+                else:
+                    try:
+                        self.model.forward = torch.compile(
+                            self.model.forward,
+                            mode="reduce-overhead",
+                            fullgraph=False,
+                            dynamic=True,   # batch shape varies; avoids constant recompile
+                        )
+                        self.log("torch.compile enabled (mode=reduce-overhead, dynamic).")
+                    except Exception as e:
+                        self.log(f"torch.compile setup failed ({e}); continuing without compile.")
+
+            # Warmup: одна холостая генерация, чтобы оплатить CUDA/SDPA init сейчас,
+            # а не на первом файле пользователя (иначе первый прогон висит 2–5 с).
+            try:
+                with torch.inference_mode():
+                    mel_bins = getattr(self.model.config, "num_mel_bins", 80)
+                    dummy = torch.zeros(1, mel_bins, 3000, dtype=config.torch_dtype, device=config.device)
+                    self.model.generate(dummy, max_new_tokens=1)
+                self.log("Warmup pass complete.")
+            except Exception as e:
+                self.log(f"Warmup skipped: {e}")
+
             self.log("Model loading complete.")
         except Exception as e:
             self.log(f"Error loading model: {e}")
@@ -327,7 +458,12 @@ class WhisperCore:
             target_rms = 10 ** (target_db / 20)
             audio = audio * (target_rms / rms)
 
-        audio = np.clip(audio, -1.0, 1.0)
+        # Peak rescale (not clip): preserves dynamics of percussive/dynamic recordings.
+        # Hard clipping at 1.0 after RMS gain produces flat-tops -> intermodulation
+        # distortion that the encoder hears as garbled phonemes.
+        peak = float(np.max(np.abs(audio))) if audio.size else 0.0
+        if peak > 0.99:
+            audio = audio * (0.99 / peak)
         
         # Resample
         if sr != target_sr:
@@ -509,9 +645,14 @@ class WhisperCore:
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
+                # Split with 0.5s overlap on each side so stitch_text has real shared
+                # acoustic content to align — splitting at exact midpoint cuts a word.
+                overlap = sr // 2
                 mid = len(chunk) // 2
-                left = self.transcribe_chunk_safe(chunk[:mid], sr, config)
-                right = self.transcribe_chunk_safe(chunk[mid:], sr, config)
+                left_end   = min(len(chunk), mid + overlap)
+                right_start = max(0, mid - overlap)
+                left  = self.transcribe_chunk_safe(chunk[:left_end], sr, config)
+                right = self.transcribe_chunk_safe(chunk[right_start:], sr, config)
                 return self.stitch_text(left, right)
             raise
 
@@ -519,59 +660,33 @@ class WhisperCore:
         """Raw model generation."""
         if not chunks: return []
 
-        forced_ids = None if config.auto_lang else self.processor.get_decoder_prompt_ids(
-            language=config.lang, task="transcribe"
-        )
-
+        # Native language/task kwargs (replaces deprecated forced_decoder_ids path).
         decode_kwargs = {
-            "forced_decoder_ids": forced_ids,
             "max_new_tokens": config.max_new_tokens,
-            "temperature": 0.0,
             "do_sample": False,
             "repetition_penalty": 1.1,
             "no_repeat_ngram_size": 5,
         }
+        if not config.auto_lang:
+            decode_kwargs["language"] = config.lang
+            decode_kwargs["task"] = "transcribe"
         if config.decode_profile == "quality":
-            decode_kwargs["num_beams"] = 5
-            decode_kwargs["early_stopping"] = True
+            decode_kwargs["num_beams"] = 3
+            decode_kwargs["length_penalty"] = 1.0
+            decode_kwargs["early_stopping"] = False
 
         with torch.inference_mode():
-            try:
-                processed = self.processor(
-                    chunks,
-                    sampling_rate=sr,
-                    padding=True,
-                    return_attention_mask=True,
-                    return_tensors="pt"
-                )
-            except TypeError as e:
-                if "return_attention_mask" not in str(e).lower():
-                    raise
-                self.log("Whisper processor does not support return_attention_mask in this transformers build. Retrying.")
-                processed = self.processor(
-                    chunks,
-                    sampling_rate=sr,
-                    padding=True,
-                    return_tensors="pt"
-                )
+            processed = self.processor(
+                chunks,
+                sampling_rate=sr,
+                return_tensors="pt",
+            )
             input_features = processed.input_features.to(config.device, dtype=config.torch_dtype)
-            attention_mask = getattr(processed, "attention_mask", None)
-            if attention_mask is not None:
-                attention_mask = attention_mask.to(config.device)
 
-            generate_kwargs = dict(decode_kwargs)
-            if attention_mask is not None and self.supports_attention_mask:
-                generate_kwargs["attention_mask"] = attention_mask
-
-            try:
-                predicted_ids = self.model.generate(input_features, **generate_kwargs)
-            except TypeError as e:
-                if "attention_mask" not in str(e).lower() or not self.supports_attention_mask:
-                    raise
-                self.supports_attention_mask = False
-                self.log("Whisper generate() does not support attention_mask in this transformers build. Retrying.")
-                generate_kwargs.pop("attention_mask", None)
-                predicted_ids = self.model.generate(input_features, **generate_kwargs)
+            # Note: do NOT forward processor's attention_mask to Whisper.generate() —
+            # it is a waveform-level mask, not aligned to the encoder's mel frames.
+            # Whisper's encoder operates on a fixed 30 s mel canvas and handles padding internally.
+            predicted_ids = self.model.generate(input_features, **decode_kwargs)
 
             texts = self.processor.batch_decode(predicted_ids, skip_special_tokens=True)
             return list(texts)
@@ -581,16 +696,89 @@ class WhisperCore:
             return max(1, min(config.batch_size, 2))
         return max(1, config.batch_size)
 
+    def _ensure_pipeline(self, config: TranscriptionConfig):
+        """Build the HF ASR pipeline lazily after the model is loaded."""
+        if self.asr_pipeline is not None:
+            return
+        if self.model is None or self.processor is None:
+            raise RuntimeError("Model must be loaded before building HF pipeline")
+        # device for pipeline: torch.device for cuda, -1 for CPU
+        if config.device == "cpu":
+            pipe_device = -1
+        else:
+            pipe_device = torch.device(config.device)
+        # transformers>=5 renamed the pipeline kwarg to 'dtype' (torch_dtype still
+        # works but emits a deprecation warning). Accept either, prefer the new name.
+        pipe_kwargs = dict(
+            model=self.model,
+            tokenizer=self.processor.tokenizer,
+            feature_extractor=self.processor.feature_extractor,
+            device=pipe_device,
+        )
+        try:
+            self.asr_pipeline = pipeline(
+                "automatic-speech-recognition",
+                dtype=config.torch_dtype,
+                **pipe_kwargs,
+            )
+        except TypeError:
+            # older transformers that don't know 'dtype' yet
+            self.asr_pipeline = pipeline(
+                "automatic-speech-recognition",
+                torch_dtype=config.torch_dtype,
+                **pipe_kwargs,
+            )
+        self.log("HF ASR pipeline initialized.")
+
+    def _run_pipeline(self, audio: np.ndarray, sr: int, config: TranscriptionConfig
+                     ) -> Tuple[str, List[dict]]:
+        """One-shot long-form transcription via HF pipeline.
+        Returns (full_text, chunks) where chunks is a list of
+        {'text': str, 'timestamp': (start_sec, end_sec)} dicts.
+        """
+        self._ensure_pipeline(config)
+
+        gen_kwargs = {
+            "no_repeat_ngram_size": 5,
+            "repetition_penalty": 1.1,
+            "max_new_tokens": config.max_new_tokens,
+            "condition_on_prev_tokens": True,
+        }
+        if not config.auto_lang:
+            gen_kwargs["language"] = config.lang
+            gen_kwargs["task"] = "transcribe"
+        if config.decode_profile == "quality":
+            gen_kwargs["num_beams"] = 3
+            gen_kwargs["length_penalty"] = 1.0
+            gen_kwargs["early_stopping"] = False
+
+        bs = self.get_effective_batch_size(config)
+
+        with torch.inference_mode():
+            result = self.asr_pipeline(
+                {"array": audio.astype(np.float32, copy=False), "sampling_rate": sr},
+                chunk_length_s=30.0,
+                stride_length_s=(config.pipeline_stride_sec, config.pipeline_stride_sec),
+                batch_size=bs,
+                generate_kwargs=gen_kwargs,
+                return_timestamps=True,
+            )
+        text = (result.get("text") or "").strip()
+        chunks = result.get("chunks") or []
+        return text, chunks
+
     def process_files(self, file_paths: List[Path], config: TranscriptionConfig):
         """Main entry point to process a list of files."""
         self.stop_requested = False
         self.current_config = config
-        
+
+        # Create the destination before touching the model — a slow or failing
+        # load should not cost us the ability to save once we do have output.
+        config.output_dir.mkdir(parents=True, exist_ok=True)
+
         if not self.model:
             self.load_model(config)
-            
-        config.output_dir.mkdir(parents=True, exist_ok=True)
-        
+
         overall_total = len(file_paths)
         
         for idx, file_path in enumerate(file_paths):
@@ -603,17 +791,60 @@ class WhisperCore:
             try:
                 # Load Audio
                 try:
-                    audio, sr = sf.read(str(file_path))
+                    # dtype='float32' avoids soundfile's default float64 for PCM_24
+                    # and skips a second pass of type conversion in normalize_audio.
+                    audio, sr = sf.read(str(file_path), dtype="float32")
                     audio, sr = self.normalize_audio(audio, sr, target_db=config.target_db)
                 except Exception as e:
                     self.log(f"Failed to read audio {file_path.name}: {e}")
                     continue
 
+                # ----- HF pipeline path (single-shot long-form) -----
+                if config.use_hf_pipeline:
+                    self.update_progress((idx + 0.05) / overall_total,
+                                         f"Pipeline: {file_path.name}")
+                    try:
+                        text, pipe_chunks = self._run_pipeline(audio, sr, config)
+                    except RuntimeError as e:
+                        if "out of memory" not in str(e).lower():
+                            raise
+                        # OOM in pipeline -> drop pipeline state, free VRAM, fall back
+                        # to the manual VAD/batch path for this file.
+                        self.log("OOM in HF pipeline. Falling back to manual loop for this file...")
+                        self.asr_pipeline = None
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                    else:
+                        # Save TXT
+                        stem = file_path.stem
+                        txt_path = config.output_dir / f"{stem}.txt"
+                        with open(txt_path, "w", encoding="utf-8") as f:
+                            f.write(text)
+                        self.log(f"Saved TXT: {txt_path.name}")
+                        # Save SRT from pipeline chunks
+                        if config.save_srt and pipe_chunks:
+                            srt_path = config.output_dir / f"{stem}.srt"
+                            with open(srt_path, "w", encoding="utf-8") as f:
+                                for k, ch in enumerate(pipe_chunks, 1):
+                                    ts = ch.get("timestamp") or (None, None)
+                                    s_sec = ts[0] if ts[0] is not None else 0.0
+                                    e_sec = ts[1] if ts[1] is not None else (s_sec + 1.0)
+                                    f.write(f"{k}\n{_fmt_srt_time(s_sec)} --> {_fmt_srt_time(e_sec)}\n{(ch.get('text') or '').strip()}\n\n")
+                            self.log(f"Saved SRT: {srt_path.name}")
+                        self.update_progress((idx + 1.0) / overall_total,
+                                             f"Done: {file_path.name}")
+                        continue  # next file
+
+                # ----- Manual VAD/batch path (fallback and default) -----
                 # Prepare Segments
                 segments = self.prepare_segments(audio, sr, config)
                 if self.stop_requested:
                     self.log("Stopped by user.")
                     break
+                if not segments:
+                    self.log(f"No speech detected in {file_path.name}; skipping.")
+                    continue
                 chunks = [audio[s:e] for s, e in segments]
                 
                 # Transcribe
@@ -633,16 +864,18 @@ class WhisperCore:
                     # Pre-filter extremely quiet chunks to avoid hallucinations
                     valid_batch = []
                     valid_indices = []
+                    sil_thr = config.silence_amplitude_threshold
                     for idx_b, chunk in enumerate(batch):
-                        if np.max(np.abs(chunk)) > 0.005: 
+                        if chunk.size and float(np.max(np.abs(chunk))) > sil_thr:
                             valid_batch.append(chunk)
                             valid_indices.append(idx_b)
-                    
-                    # File-level progress
+
+                    # File-level progress. Status string is localized in the GUI
+                    # layer; emit a neutral format string here.
                     file_percent = min(1.0, (i + len(batch)) / total_chunks)
                     overall_percent = (idx + file_percent) / overall_total
                     pct = int(file_percent * 100)
-                    self.update_progress(overall_percent, f"Обработка: {pct}%")
+                    self.update_progress(overall_percent, f"transcribing:{pct}")
                     
                     try:
                         if valid_batch:
@@ -656,13 +889,15 @@ class WhisperCore:
                             texts = [""] * len(batch)
                             
                         all_texts.extend(texts)
-                        # Log preview for debug
-                        if texts and texts[0].strip():
-                            full_text = texts[0].strip()
-                            snippet = full_text[:100] + "..." if len(full_text) > 100 else full_text
-                            self.log(f"  → {snippet}")
-                        elif texts:
-                            self.log(f"  → [тишина]")
+                        # Log a short preview of every item in the batch (not just
+                        # texts[0]) so debug output reflects the full work done.
+                        for t_idx, t in enumerate(texts):
+                            tt = (t or "").strip()
+                            if not tt:
+                                self.log(f"  [{i + t_idx}] -> [silence]")
+                            else:
+                                snippet = tt[:100] + "..." if len(tt) > 100 else tt
+                                self.log(f"  [{i + t_idx}] -> {snippet}")
                     except RuntimeError as e:
                         if "out of memory" in str(e).lower():
                             self.log("OOM in batch. Falling back to serial...")
@@ -677,27 +912,51 @@ class WhisperCore:
                     self.log("Stopped by user.")
                     break
                 
-                # Stitching/Aggregation
+                # Stitching/Aggregation.
+                # Two distinct cases that must NOT be conflated:
+                #   (A) Acoustic overlap (s < previous_end_in_samples): segments share
+                #       audio (sliding window or split-with-overlap path). Whisper will
+                #       transcribe the shared region twice, so we need stitch_text() to
+                #       detect and remove the duplicate words.
+                #   (B) No overlap (consecutive VAD segments): just concatenate. Calling
+                #       stitch_text on these is the bug — it can find a coincidental
+                #       3-word match between unrelated sentences and DELETE the prefix
+                #       of the second sentence.
+                # The time_gap heuristic decides whether to merge into one final entry
+                # (close in time / no terminal punctuation) or start a new entry.
                 self.log("Finalizing text...")
                 final_segments = []
+                last_end_sample = -1  # end of previous accepted source segment, in samples
                 for j, ((s, e), text) in enumerate(zip(segments, all_texts)):
                     text = text.strip()
                     if not text:
                         continue
-                        
+
+                    overlapping = (s < last_end_sample)
+
                     if not final_segments:
                         final_segments.append([text, s/sr, e/sr])
                     else:
                         prev_text, ps, pe = final_segments[-1]
-                        # Only stitch if segments are very close or overlapping (sliding window)
-                        # or if previous doesn't end with punctuation
                         time_gap = (s/sr) - pe
-                        
-                        if time_gap < 0.5 or not prev_text.rstrip().endswith(('.', '!', '?', '。', '！', '？')):
+                        close_in_time = time_gap < 0.5
+                        no_terminal_punct = not prev_text.rstrip().endswith(('.', '!', '?', '。', '！', '？'))
+
+                        if overlapping:
+                            # Real shared audio -> dedupe via overlap matcher.
                             joined = self.stitch_text(prev_text, text)
                             final_segments[-1] = [joined, ps, e/sr]
+                        elif close_in_time or no_terminal_punct:
+                            # Adjacent but non-overlapping -> safe concatenate (no word loss).
+                            final_segments[-1] = [
+                                prev_text.rstrip() + " " + text.lstrip(),
+                                ps,
+                                e/sr,
+                            ]
                         else:
                             final_segments.append([text, s/sr, e/sr])
+
+                    last_end_sample = e
                 
                 # Convert back to tuples
                 final_segments = [tuple(x) for x in final_segments]
@@ -715,13 +974,7 @@ class WhisperCore:
                     srt_path = config.output_dir / f"{stem}.srt"
                     with open(srt_path, "w", encoding="utf-8") as f:
                         for k, (t, s, e) in enumerate(final_segments, 1):
-                            # format time helper
-                            def fmt(sec):
-                                ms = int((sec % 1) * 1000)
-                                m, s_ = divmod(int(sec), 60)
-                                h, m = divmod(m, 60)
-                                return f"{h:02d}:{m:02d}:{s_:02d},{ms:03d}"
-                            f.write(f"{k}\n{fmt(s)} --> {fmt(e)}\n{t}\n\n")
+                            f.write(f"{k}\n{_fmt_srt_time(s)} --> {_fmt_srt_time(e)}\n{t}\n\n")
                     self.log(f"Saved SRT: {srt_path.name}")
                     
             except Exception as e:

@@ -52,6 +52,17 @@ Thumbs.db
 .DS_Store
 desktop.ini
 
+# --- Claude Code / agent state ---
+.claude/
+.claudeignore
+
+# --- App-local user data (settings.json lives here in dev runs) ---
+.whisper_gui/
+
+# --- Local smoke tests / scratch ---
+_smoke_*.py
+scratch/
+
 # --- Distribution / packaging ---
 dist/
 build/
