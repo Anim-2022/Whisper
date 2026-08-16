@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """A dismissable banner shown above the tabview for errors and warnings.
 
 Goal: surface problems (validation, worker crashes, missing folders)
@@ -16,7 +15,6 @@ from __future__ import annotations
 import customtkinter as ctk
 
 from .. import constants as C
-
 
 # Dark-mode friendly pairs. Keeping them local (not in constants.py) since
 # they're only meaningful to the banner widget itself.

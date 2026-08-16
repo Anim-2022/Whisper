@@ -1,30 +1,29 @@
-# -*- coding: utf-8 -*-
-from tkinter import filedialog, messagebox
-import customtkinter as ctk
 import os
-import subprocess
-import threading
 import queue
 import statistics
+import subprocess
 import sys
+import threading
 import time
-import torch
 from pathlib import Path
-from typing import List, Optional
+from tkinter import filedialog, messagebox
+
+import customtkinter as ctk
+import torch
 
 try:
-    from whisper_core import WhisperCore, TranscriptionConfig
+    from whisper_core import TranscriptionConfig, WhisperCore
 except ImportError:
     sys.path.append(str(Path(__file__).parent))
-    from whisper_core import WhisperCore, TranscriptionConfig
+    from whisper_core import TranscriptionConfig, WhisperCore
 
 # Single source of truth for theme/colors/sizes/lists/presets lives in gui/.
 from gui import constants as C
 from gui import settings_store
 from gui.i18n import UI_TEXT
-from gui.widgets import settings_tab as settings_tab_builder
 from gui.widgets import advanced_tab as advanced_tab_builder
 from gui.widgets import logs_tab as logs_tab_builder
+from gui.widgets import settings_tab as settings_tab_builder
 from gui.widgets.error_banner import ErrorBanner
 from gui.widgets.preview_dialog import open_preview
 
@@ -56,9 +55,9 @@ class WhisperGUI(ctk.CTk):
         self.progress_queue = queue.Queue()
         # Banner messages enqueued from the worker thread; drained on the
         # Tk main thread inside process_queues. Items: (level, message).
-        self.banner_queue: "queue.Queue[tuple[str, str]]" = queue.Queue()
+        self.banner_queue: queue.Queue[tuple[str, str]] = queue.Queue()
         self.is_running = False
-        self.files_to_process: List[Path] = []
+        self.files_to_process: list[Path] = []
         self.ui_language = C.DEFAULT_UI_LANGUAGE
         self.preset_keys = list(C.PRESET_KEYS)
         self.decode_profile_keys = list(C.DECODE_PROFILE_KEYS)
@@ -72,13 +71,13 @@ class WhisperGUI(ctk.CTk):
         self.current_file_index = 0
         self.current_file_name = ""
         self._file_started_at = 0.0
-        self._completed_durations: List[float] = []
+        self._completed_durations: list[float] = []
         self.has_cuda = torch.cuda.is_available()
         self.has_local_vad = False
         # Phase F: post-run "Open folder" / "View result" need to know what was
         # produced. Updated whenever we see a "Done: <name>" status from core.
-        self.last_output_dir: Optional[Path] = None
-        self.last_result_path: Optional[Path] = None
+        self.last_output_dir: Path | None = None
+        self.last_result_path: Path | None = None
         # Widgets that should grey out while a job is running. Filled below as
         # the sidebar / tabs are built.
         self._input_widgets: list = []
@@ -318,7 +317,7 @@ class WhisperGUI(ctk.CTk):
     def preset_description(self, preset_key: str) -> str:
         return self.t(f"preset_{preset_key}_desc")
 
-    def localized_preset_values(self) -> List[str]:
+    def localized_preset_values(self) -> list[str]:
         return [self.preset_display_text(key) for key in self.preset_keys]
 
     def preset_key_from_value(self, value: str) -> str:
@@ -339,7 +338,7 @@ class WhisperGUI(ctk.CTk):
     def decode_profile_label(self, profile_key: str) -> str:
         return self.t(f"decode_{profile_key}")
 
-    def localized_decode_profile_values(self) -> List[str]:
+    def localized_decode_profile_values(self) -> list[str]:
         return [self.decode_profile_label(key) for key in self.decode_profile_keys]
 
     def decode_profile_key_from_value(self, value: str) -> str:
@@ -540,7 +539,7 @@ class WhisperGUI(ctk.CTk):
         entry.delete(0, "end")
         entry.insert(0, str(value))
 
-    def discover_local_models(self) -> List[str]:
+    def discover_local_models(self) -> list[str]:
         models_root = Path(__file__).parent / C.LOCAL_MODELS_SUBDIR
         if not models_root.exists():
             return []

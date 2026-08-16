@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Persist user settings between sessions.
 
 Layout on disk:
@@ -22,10 +21,9 @@ import json
 import os
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any
 
 from . import constants as C
-
 
 SETTINGS_DIRNAME = ".whisper_gui"
 SETTINGS_FILENAME = "settings.json"
@@ -39,7 +37,7 @@ def get_default_path() -> Path:
 
 # Defaults for any missing key. Matches the values the app would show on a
 # brand-new install with the "fast" preset applied.
-def _build_defaults() -> Dict[str, Any]:
+def _build_defaults() -> dict[str, Any]:
     fast = C.PRESETS["fast"]
     return {
         "schema_version": SCHEMA_VERSION,
@@ -77,10 +75,10 @@ def _build_defaults() -> Dict[str, Any]:
     }
 
 
-DEFAULTS: Dict[str, Any] = _build_defaults()
+DEFAULTS: dict[str, Any] = _build_defaults()
 
 
-def load(path: Optional[Path] = None) -> Dict[str, Any]:
+def load(path: Path | None = None) -> dict[str, Any]:
     """Load settings, falling back to defaults for missing/invalid file.
 
     Never raises. Unknown extra keys are kept (forward-compat with newer
@@ -105,7 +103,7 @@ def load(path: Optional[Path] = None) -> Dict[str, Any]:
     return merged
 
 
-def save(settings: Dict[str, Any], path: Optional[Path] = None) -> bool:
+def save(settings: dict[str, Any], path: Path | None = None) -> bool:
     """Atomically write settings to disk. Returns True on success."""
     target = path or get_default_path()
     try:

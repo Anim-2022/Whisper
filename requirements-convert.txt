@@ -1,0 +1,18 @@
+# One-time model conversion only — NOT needed to run the application.
+#
+#   pip install -r requirements-convert.txt
+#   python tools/convert_models.py
+#
+# tools/convert_models.py is the only module that imports torch and transformers,
+# and it is outside the application's import graph. Keeping these here is what
+# lets the runtime environment stay at ~1.5 GB instead of ~6.5 GB.
+#
+# Install into a throwaway environment if you prefer; the output is plain files
+# under models/ct2/ that the runtime reads without any of this installed.
+
+--extra-index-url https://download.pytorch.org/whl/cu124
+
+ctranslate2>=4.0,<5.0
+torch
+transformers>=5.0,<6.0
+accelerate

@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Read-only preview window for the latest transcript file.
 
 Lets the user inspect a finished .txt without opening an external editor.
@@ -10,7 +9,6 @@ from __future__ import annotations
 
 from pathlib import Path
 from tkinter import filedialog
-from typing import Optional
 
 import customtkinter as ctk
 
@@ -120,7 +118,7 @@ class PreviewDialog(ctk.CTkToplevel):
             )
 
 
-def open_preview(master, path: Optional[Path], t) -> Optional[PreviewDialog]:
+def open_preview(master, path: Path | None, t) -> PreviewDialog | None:
     """Spawn a PreviewDialog if `path` exists; return the window (or None)."""
     if path is None or not Path(path).exists():
         return None

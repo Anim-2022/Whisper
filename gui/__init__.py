@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Modular GUI package for Whisper Unified.
 
 Subpackages:

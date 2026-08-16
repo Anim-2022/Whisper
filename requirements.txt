@@ -1,0 +1,16 @@
+# Runtime dependencies. CPU-safe and installable in CI — no CUDA wheels here.
+#
+# For GPU inference also install requirements-gpu.txt.
+# To convert HuggingFace weights to CTranslate2, see requirements-convert.txt.
+
+# ASR engine. Pulls in ctranslate2, av (PyAV, bundles FFmpeg — this is what
+# decodes m4a/mp4/webm), onnxruntime (bundled Silero VAD), tokenizers,
+# huggingface_hub and tqdm.
+faster-whisper>=1.2,<2.0
+
+numpy>=2.0,<3.0
+
+# GUI
+customtkinter>=5.2,<6.0
+darkdetect>=0.8
+packaging>=24.0

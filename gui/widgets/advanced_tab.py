@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Build the 'Advanced' tab (Speed&Compute / Segmentation sections).
 
 Same conventions as `settings_tab.build`: attaches widgets onto the
@@ -10,13 +9,13 @@ from __future__ import annotations
 import customtkinter as ctk
 
 from .. import constants as C
-from ..validators import IntRangeValidator, FloatRangeValidator
+from ..validators import FloatRangeValidator, IntRangeValidator
 from .field_factory import (
-    make_help_label,
-    make_section_header,
-    make_labeled_entry,
-    make_labeled_combo,
     make_field_label,
+    make_help_label,
+    make_labeled_combo,
+    make_labeled_entry,
+    make_section_header,
 )
 
 
@@ -67,7 +66,8 @@ def _build_compute_section(app, parent) -> None:
         parent=parent, app=app, row=1, text_key="section_compute",
     )
 
-    refresh = lambda _value: app.refresh_runtime_summary()
+    def refresh(_value):
+        app.refresh_runtime_summary()
 
     app.device_label, app.combo_device = make_labeled_combo(
         parent=parent, app=app, row=2,

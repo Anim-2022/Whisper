@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Build the 'Logs' tab (intro panel + log textbox).
 
 Same conventions as the other tab modules. Behavior identical to the

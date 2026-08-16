@@ -12,6 +12,8 @@ __pycache__/
 
 # --- Virtual environments ---
 .venv/
+.venv-fw/
+.venv-torch/
 venv/
 env/
 ENV/
@@ -33,12 +35,14 @@ audio/
 *.webm
 
 # --- Transcription output ---
+# Directory rules only. Every writer targets one of these, so there is no need for
+# blanket *.txt / *.srt patterns — and those actively caused trouble: they fought
+# the READMEs (hence the fragile !README.* negation list, which was already missing
+# README.uk.md) and would now swallow the requirements-*.txt files.
 audio_to_text/
 args_output/
-*.srt
-*.txt
-!README.md
-!README.ru.md
+predictions/
+references/
 
 # --- Logs ---
 *.log
@@ -62,6 +66,12 @@ desktop.ini
 # --- Local smoke tests / scratch ---
 _smoke_*.py
 scratch/
+
+# --- Test & lint caches ---
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 
 # --- Distribution / packaging ---
 dist/

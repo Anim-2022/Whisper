@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Build the 'Settings' tab (Files / Model / Output sections).
 
 The function takes the WhisperGUI instance and attaches widgets onto it
@@ -14,11 +13,10 @@ import customtkinter as ctk
 
 from .. import constants as C
 from .field_factory import (
-    make_help_label,
-    make_section_header,
-    make_labeled_browse_row,
-    make_labeled_combo,
     make_field_label,
+    make_help_label,
+    make_labeled_browse_row,
+    make_section_header,
 )
 
 

@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """UI translations and a small helper for runtime language switching.
 
 This module owns the UI_TEXT dictionary that used to live at the top of
@@ -12,14 +11,12 @@ Helpers exposed:
     t(lang, key, **kwargs) — module-level translator (used by future modules
                              that don't have a self reference)
 """
-from typing import Dict
-
 
 SUPPORTED_LANGUAGES = ("en", "ru")
 DEFAULT_LANGUAGE = "ru"
 
 
-UI_TEXT: Dict[str, Dict[str, str]] = {
+UI_TEXT: dict[str, dict[str, str]] = {
     "en": {
         "label_interface_language": "Interface language",
         "label_preset": "Preset",

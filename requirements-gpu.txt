@@ -1,0 +1,15 @@
+# CUDA runtime libraries for GPU inference. Install alongside requirements.txt.
+#
+#   pip install -r requirements.txt -r requirements-gpu.txt
+#
+# The CTranslate2 Windows wheel links against cuBLAS and cuDNN but ships neither,
+# so they must come from somewhere. These pip wheels are preferred over the DLLs
+# bundled with torch: CTranslate2 4.8.x is built against CUDA 12.8 / cuDNN 9.10,
+# while torch 2.6+cu124 carries CUDA 12.4 / cuDNN 9.1 — older than the build
+# target. whisper_engine/cuda_dlls.py registers these directories at startup.
+#
+# Do NOT install this in CI: ~1.2 GB of wheels with no GPU to use them.
+
+nvidia-cublas-cu12>=12.8.3.14
+nvidia-cuda-runtime-cu12>=12.8.57
+nvidia-cudnn-cu12>=9.10.2.21,<10
