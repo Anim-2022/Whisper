@@ -168,14 +168,36 @@ def _build_language_section(app, parent) -> None:
 
     make_help_label(parent=parent, app=app, row=12, text_key="help_language")
 
+    # Seeding the decoder with attendee names and product jargon measurably
+    # improves how they are spelled, so it belongs next to the language choice
+    # rather than buried in Advanced.
+    app.initial_prompt_label = make_field_label(
+        parent=parent, app=app, row=13, text_key="label_initial_prompt",
+    )
+    app.entry_initial_prompt = ctk.CTkEntry(
+        parent, placeholder_text=app.t("placeholder_initial_prompt"),
+    )
+    app.entry_initial_prompt.grid(row=13, column=1, columnspan=2, sticky="ew", padx=10, pady=5)
+    make_help_label(parent=parent, app=app, row=14, text_key="help_initial_prompt")
+
 
 # ----------------------------------------------------------------------
-# Output section — SRT toggle
+# Output section — one checkbox per format
 # ----------------------------------------------------------------------
 def _build_output_section(app, parent) -> None:
     app.output_section_label = make_section_header(
-        parent=parent, app=app, row=13, text_key="section_output", pady=(20, 5),
+        parent=parent, app=app, row=15, text_key="section_output", pady=(20, 5),
     )
-    app.check_srt = ctk.CTkCheckBox(parent, text=app.t("checkbox_srt"))
-    app.check_srt.grid(row=14, column=1, sticky="w", padx=10, pady=(4, 5))
-    make_help_label(parent=parent, app=app, row=15, text_key="help_srt")
+
+    app.format_frame = ctk.CTkFrame(parent, fg_color="transparent")
+    app.format_frame.grid(row=16, column=1, columnspan=2, sticky="w", padx=10, pady=(4, 5))
+
+    app.format_checkboxes = {}
+    for column, fmt in enumerate(C.OUTPUT_FORMATS):
+        checkbox = ctk.CTkCheckBox(app.format_frame, text=app.t(f"checkbox_format_{fmt}"))
+        checkbox.grid(row=0, column=column, sticky="w", padx=(0, 14))
+        if fmt in C.DEFAULT_OUTPUT_FORMATS:
+            checkbox.select()
+        app.format_checkboxes[fmt] = checkbox
+
+    make_help_label(parent=parent, app=app, row=17, text_key="help_formats")

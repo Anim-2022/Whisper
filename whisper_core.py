@@ -122,12 +122,17 @@ class WhisperCore:
                     self.on_result(path, written)
                 break
 
+            # Order matters: the consumer reacts to the "Done" status by lighting
+            # up its post-run actions, so it has to already know which files were
+            # written. Reporting the paths first makes that ordering a property of
+            # the core rather than of the consumer's queue-draining order.
+            if self.on_result:
+                self.on_result(path, written)
+
             # Unconditional on the success path. The absence of this emission on
             # the default path is what previously left the GUI's "View result"
             # button permanently disabled and its per-file ETA always empty.
             self.reporter.file_done(index, path.name)
-            if self.on_result:
-                self.on_result(path, written)
 
         if self.stop_requested:
             self.log("Stopped by user.")

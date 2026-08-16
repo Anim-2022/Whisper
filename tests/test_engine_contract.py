@@ -134,6 +134,26 @@ def test_on_result_reports_real_written_paths(harness):
         assert all(p.stem == source.stem for p in written)
 
 
+def test_written_paths_are_reported_before_the_done_status(tmp_path):
+    """A consumer lights up its post-run actions on "Done", so by then it must
+    already know which files exist. Reversing these two lines leaves the GUI's
+    "View result" button disabled even though the transcript is on disk."""
+    p = tmp_path / "a.wav"
+    p.write_bytes(b"")
+
+    order = []
+    core = WhisperCore(
+        on_progress=lambda pct, s: order.append(parse_status(s).kind),
+        on_result=lambda path, written: order.append("result"),
+        engine_factory=lambda on_log=None: StubEngine(),
+    )
+    core.process_files([p], TranscriptionConfig(device="cpu", output_dir=tmp_path / "out"))
+
+    assert "result" in order, "on_result was never called"
+    assert "done_file" in order, "the Done status was never emitted"
+    assert order.index("result") < order.index("done_file")
+
+
 def test_segments_stream_to_the_callback(harness):
     core, _, _, config, files, segments, _ = harness
     core.process_files(files, config)
