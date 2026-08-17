@@ -60,6 +60,17 @@ def model_dir(fake_ct2_dir, monkeypatch, tmp_path):
     return d
 
 
+@pytest.fixture
+def pretend_cuda(monkeypatch):
+    """Let a config keep device="cuda" on a machine without a GPU.
+
+    Without this the fallback tests silently test nothing: `resolve_device`
+    rewrites "cuda" to "cpu" up front on a CI runner, the fake model constructor
+    never sees "cuda", and no fallback is ever triggered.
+    """
+    monkeypatch.setattr("whisper_engine.device.has_cuda", lambda: True)
+
+
 def cfg(**kw):
     kw.setdefault("model_id", "whisper-medium")
     return TranscriptionConfig(**kw)
@@ -85,7 +96,7 @@ def test_changing_the_request_reloads(fake_faster_whisper, model_dir, changed):
     assert FakeModel.instances == 2
 
 
-def test_cuda_failure_falls_back_to_cpu(fake_faster_whisper, model_dir):
+def test_cuda_failure_falls_back_to_cpu(fake_faster_whisper, model_dir, pretend_cuda):
     fake_faster_whisper(FailingOnCuda)
     logs = []
     engine = WhisperEngine(on_log=logs.append)
@@ -97,7 +108,7 @@ def test_cuda_failure_falls_back_to_cpu(fake_faster_whisper, model_dir):
     assert any("CUDA initialization failed" in line for line in logs)
 
 
-def test_the_fallback_is_not_retried_for_every_file(fake_faster_whisper, model_dir):
+def test_the_fallback_is_not_retried_for_every_file(fake_faster_whisper, model_dir, pretend_cuda):
     """The regression this test exists for.
 
     Comparing the loaded state against config.device would leave the engine on
@@ -125,7 +136,7 @@ def test_unload_clears_the_request_too(fake_faster_whisper, model_dir):
     assert FakeModel.instances == 2
 
 
-def test_engine_info_reports_the_effective_device(fake_faster_whisper, model_dir):
+def test_engine_info_reports_the_effective_device(fake_faster_whisper, model_dir, pretend_cuda):
     """Metadata must describe where it actually ran, not what was asked for."""
     fake_faster_whisper(FailingOnCuda)
     engine = WhisperEngine()
