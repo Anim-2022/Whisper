@@ -89,7 +89,7 @@ OUTPUT_FORMATS: list[str] = ["txt", "srt", "vtt", "json", "md"]
 DEFAULT_OUTPUT_FORMATS: tuple[str, ...] = ("txt",)
 
 # Order of presets in the UI combo and used as canonical keys everywhere
-PRESET_KEYS: list[str] = ["fast", "accurate", "noisy"]
+PRESET_KEYS: list[str] = ["meeting", "long", "difficult"]
 # Replaces the old balanced/quality decode profiles. The split is now honest about
 # what actually differs: the batched pipeline discards condition-on-previous-text,
 # the temperature ladder and the hallucination filter.
@@ -137,16 +137,40 @@ LOG_PROB_THRESHOLD_RANGE: tuple[float, float] = (-5.0, 0.0)
 HALLUCINATION_SILENCE_RANGE: tuple[float, float] = (0.0, 10.0)
 
 # --------------------------------------------------------------------------
-# Presets, re-authored for faster-whisper.
+# Presets, chosen from measurements rather than intuition.
 #
-# "accurate" is the recommended default: batched medium measured ~60-70x realtime
-# on a 16 GB GPU while matching the previous engine's punctuation. There is no
-# longer a meaningful speed/quality trade-off between it and "fast", only a beam
-# width, so "fast" exists for drafts and slow machines.
+# Benchmarked on an RTX 4060 Ti over three recordings: a 4.5 min German work
+# meeting (multi-speaker, 34 % speech), a 6 min Russian lecture with English
+# technical terms, and the same lecture deliberately degraded (quiet, band-
+# limited) to stand in for a bad room mic. Sixteen configurations each.
 #
-# "noisy" is the only sequential preset. Sequential is what unlocks the temperature
-# ladder, condition-on-previous-text and the hallucination filter — all of which
-# the batched pipeline discards — at roughly a quarter of the speed.
+# What the numbers said, and why the presets look like this:
+#
+#   * `condition_on_previous_text` — faster-whisper defaults it to True, and on
+#     the Russian lecture that collapsed punctuation to 2 marks per 1000 chars
+#     against 24 with it off ("Форм-групп, афилд-полю классный форм-контрол И
+#     вот для первого добавите когда"). Off everywhere. Not exposed per preset
+#     as a tempting knob — it is off in all three.
+#
+#   * Sequential vs batched is the only axis worth a preset. Batched runs at
+#     ~80x realtime against ~20-35x, but emits one segment per 30 s window
+#     (28-32 s cues, useless as subtitles) and drops words at window
+#     boundaries — the German meeting lost "wegen der Begleitung" outright.
+#     Sequential yields 2.5-4.8 s segments and the more complete text.
+#
+#   * Beam width 1 vs 5 saves only 12-16 % in batched mode and costs accuracy on
+#     hard audio (punctuation 5 vs 32 per 1000 on the degraded file), so there is
+#     no "fastest" tier worth a slot. Every preset uses beam 5.
+#
+#   * `batch_size` 8 / 16 / 24 produced byte-identical output within 1 % of the
+#     same speed. It stays adjustable for VRAM, but is not a quality lever.
+#
+#   * `int8_float16` was *slower* than float16 (61-75x vs 76-84x), so it is a
+#     VRAM saving, never a speed one. Presets leave compute type on "auto".
+#
+#   * VAD off is not a neutral choice: it cost more than half the accuracy
+#     (word error 50 % vs 45 % against the careful run, punctuation down to 0)
+#     because the model invents text over silence. On for everything.
 #
 # Schema per preset (batch_size_cuda/cpu are applied by the GUI based on device):
 #   batched, batch_size_cuda, batch_size_cpu, beam_size, temperature_fallback,
@@ -156,25 +180,34 @@ HALLUCINATION_SILENCE_RANGE: tuple[float, float] = (0.0, 10.0)
 #   vad_speech_pad_ms
 # --------------------------------------------------------------------------
 PRESETS: dict[str, dict] = {
-    "fast": {
-        "batched": True,
-        "batch_size_cuda": 16,
-        "batch_size_cpu": 4,
-        "beam_size": 1,
-        "temperature_fallback": False,
+    # Everyday default. This is exactly the configuration every quality metric in
+    # the benchmark was measured against, and it won all of them. At 20-35x
+    # realtime an hour-long meeting takes two to three minutes, so the speed of
+    # the batched path buys nothing at meeting length. Segments come out at
+    # 3-5 s, which is subtitle-grade as well as readable.
+    "meeting": {
+        "batched": False,
+        "batch_size_cuda": 8,
+        "batch_size_cpu": 1,
+        "beam_size": 5,
+        "temperature_fallback": True,
         "condition_on_previous_text": False,
         "no_speech_threshold": 0.6,
         "compression_ratio_threshold": 2.4,
         "log_prob_threshold": -1.0,
-        "hallucination_silence_threshold": None,
-        "word_timestamps": False,
+        "hallucination_silence_threshold": 2.0,
+        "word_timestamps": True,
         "vad_enabled": True,
-        "vad_threshold": 0.50,
+        "vad_threshold": 0.45,
         "vad_min_speech_ms": 250,
-        "vad_min_silence_ms": 500,
-        "vad_speech_pad_ms": 200,
+        "vad_min_silence_ms": 700,
+        "vad_speech_pad_ms": 400,
     },
-    "accurate": {
+    # For multi-hour archives, where 3-4x is the difference between 2.5 minutes
+    # and 10. Pays for it with ~30 s segments and occasional words lost at window
+    # boundaries. The sequential-only guards are omitted because the batched
+    # pipeline discards them anyway — see TranscriptionConfig.__post_init__.
+    "long": {
         "batched": True,
         "batch_size_cuda": 16,
         "batch_size_cpu": 4,
@@ -192,27 +225,46 @@ PRESETS: dict[str, dict] = {
         "vad_min_silence_ms": 700,
         "vad_speech_pad_ms": 400,
     },
-    "noisy": {
+    # Quiet rooms, distant microphones, background noise. Differs from "meeting"
+    # in exactly two values, because a one-variable-at-a-time sweep on a
+    # deliberately degraded recording showed that is all that reliably helps:
+    #
+    #   * A lower VAD threshold recovered ~4 % more transcript (2567 vs 2468
+    #     characters) by admitting faint speech the default discards, and raised
+    #     punctuation on the German meeting from 25 to 30 per 1000 characters.
+    #   * A shorter minimum speech duration keeps short interjections.
+    #
+    # Deliberately NOT changed, because the sweep showed it would be cargo cult:
+    #   * no_speech_threshold, compression_ratio_threshold and log_prob_threshold
+    #     produced byte-identical output at every value tried. They only fire on
+    #     degenerate segments, and with the temperature ladder already retrying
+    #     those, none of them ever tripped.
+    #   * More speech padding was actively harmful: 600 ms cost 8 % of the
+    #     transcript and halved punctuation density (2274 characters, 16 per
+    #     1000) against 400 ms.
+    #   * A wider beam looked good alone (37 per 1000) but combined with the
+    #     lower VAD threshold it came out worse than either change on its own.
+    "difficult": {
         "batched": False,
         "batch_size_cuda": 8,
         "batch_size_cpu": 1,
         "beam_size": 5,
         "temperature_fallback": True,
         "condition_on_previous_text": False,
-        "no_speech_threshold": 0.5,
-        "compression_ratio_threshold": 2.2,
-        "log_prob_threshold": -0.8,
-        "hallucination_silence_threshold": 1.5,
+        "no_speech_threshold": 0.6,
+        "compression_ratio_threshold": 2.4,
+        "log_prob_threshold": -1.0,
+        "hallucination_silence_threshold": 2.0,
         "word_timestamps": True,
         "vad_enabled": True,
-        "vad_threshold": 0.35,
-        "vad_min_speech_ms": 250,
-        "vad_min_silence_ms": 1000,
-        "vad_speech_pad_ms": 600,
+        "vad_threshold": 0.30,
+        "vad_min_speech_ms": 150,
+        "vad_min_silence_ms": 700,
+        "vad_speech_pad_ms": 400,
     },
 }
 
-DEFAULT_PRESET: str = "accurate"
+DEFAULT_PRESET: str = "meeting"
 
 # Preset keys that map straight onto TranscriptionConfig fields of the same name.
 _PRESET_PASSTHROUGH: tuple[str, ...] = (
