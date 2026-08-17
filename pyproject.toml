@@ -6,16 +6,19 @@
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-# GPU tests need converted weights and a CUDA device, so they are opt-in:
+# GPU tests need converted weights and a CUDA device; GUI tests need a real Tk
+# display. Both are opt-in, so the default suite runs on a headless CI runner:
 #   pytest -m gpu
-addopts = "-q -m 'not gpu'"
+#   pytest -m gui
+addopts = "-q -m 'not gpu and not gui'"
 markers = [
     "gpu: requires CUDA and converted model weights (excluded by default)",
+    "gui: requires a Tk display (excluded by default)",
 ]
 
 [tool.ruff]
 line-length = 100
-target-version = "py312"
+target-version = "py311"
 extend-exclude = [".venv", ".venv-fw", "models", "audio", "audio_to_text", "predictions"]
 
 [tool.ruff.lint]

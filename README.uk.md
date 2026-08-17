@@ -4,7 +4,7 @@
 
 **Офлайн-застосунок із графічним інтерфейсом для локальної розшифровки мовлення**
 
-[![Python](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python)](https://www.python.org/)
+[![Python](https://img.shields.io/badge/Python-3.11%2B-blue?logo=python)](https://www.python.org/)
 [![Engine](https://img.shields.io/badge/Engine-faster--whisper-orange)](https://github.com/SYSTRAN/faster-whisper)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Windows-0078d7?logo=windows)](https://www.microsoft.com/)
@@ -44,7 +44,7 @@
 | Компонент | Мінімум |
 |-----------|---------|
 | ОС | Windows 10 / 11 |
-| Python | 3.10 або новіше (розроблялося на 3.12) |
+| Python | 3.11 або новіше (CI перевіряє 3.12) |
 | ОЗП | 8 ГБ |
 | Відеокарта | NVIDIA, CUDA 12 *(рекомендовано)* |
 | Відеопам'ять | 2 ГБ для `whisper-medium`, 4 ГБ+ для `large` |

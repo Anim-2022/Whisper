@@ -20,6 +20,37 @@ from .. import constants as C
 from .validated_entry import ValidatedEntry
 
 
+class RowCounter:
+    """Hands out consecutive grid rows so sections cannot overlap.
+
+    Hardcoded row numbers are fragile in a way that fails silently: the helpers
+    below place their help line on ``row + 1``, so inserting one field into a
+    section pushes its last help line onto the next section's header and the two
+    labels are drawn on top of each other. That is exactly how the VAD padding
+    hint came to overlap the "Decoding" heading.
+
+    Callers ask for as many rows as the widget actually occupies::
+
+        make_labeled_entry(parent, app, rows.take(2), ...)   # field + help line
+        make_section_header(parent, app, rows.take(), ...)   # one row
+    """
+
+    def __init__(self, start: int = 0):
+        self._next = start
+
+    def take(self, count: int = 1) -> int:
+        """Reserve `count` rows and return the first of them."""
+        if count < 1:
+            raise ValueError("count must be >= 1")
+        first = self._next
+        self._next += count
+        return first
+
+    @property
+    def next_row(self) -> int:
+        return self._next
+
+
 def make_help_label(parent, app, row: int, text_key: str,
                     *, columnspan: int = 3, padx: int = 20):
     """Italic-style help line under a field. Tracked for re-localization."""

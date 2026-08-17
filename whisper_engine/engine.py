@@ -42,6 +42,12 @@ class WhisperEngine:
         self.device: str | None = None
         self.compute_type: str | None = None
         self.batched: bool | None = None
+        # What the caller asked for, as opposed to what we ended up running on.
+        # Without this, a CUDA request that fell back to CPU never matches the
+        # loaded state again, so every remaining file in the batch would repeat
+        # the slow failing CUDA load before falling back once more.
+        self._requested_device: str | None = None
+        self._requested_compute_type: str | None = None
 
     # -- helpers -----------------------------------------------------------
     def log(self, message: str) -> None:
@@ -66,10 +72,17 @@ class WhisperEngine:
 
     # -- loading -----------------------------------------------------------
     def _matches(self, config: TranscriptionConfig) -> bool:
+        """Is the loaded model already what this config asks for?
+
+        Compares against what was *requested* last time, not what we ended up
+        running on: after a CUDA failure the engine sits on CPU while the config
+        still says cuda, and comparing the effective device would make every
+        subsequent file retry the failing CUDA load.
+        """
         return (self.runner is not None
                 and self.model_id == config.model_id
-                and self.device == config.device
-                and self.compute_type == config.compute_type
+                and self._requested_device == config.device
+                and self._requested_compute_type == config.compute_type
                 and self.batched == config.batched)
 
     def load(self, config: TranscriptionConfig, force: bool = False) -> None:
@@ -110,12 +123,15 @@ class WhisperEngine:
         self.device = device
         self.compute_type = compute_type
         self.batched = config.batched
+        self._requested_device = config.device
+        self._requested_compute_type = config.compute_type
         self.log(f"Model ready on {device}/{compute_type} in {time.monotonic() - t0:.1f}s")
 
     def unload(self) -> None:
         self.runner = None
         self.model = None
         self.model_id = self.device = self.compute_type = None
+        self._requested_device = self._requested_compute_type = None
         self.batched = None
 
     # -- transcription -----------------------------------------------------

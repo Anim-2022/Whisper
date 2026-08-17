@@ -47,6 +47,15 @@ _NVIDIA_WHEEL_SUBDIRS = (
 
 _registered: list[str] | None = None
 
+#: Handles returned by os.add_dll_directory(), kept for the life of the process.
+#:
+#: CPython's _AddedDllDirectory only unregisters the directory from an explicit
+#: close() or __exit__ — it defines no __del__ — so dropping these would not
+#: actually break anything today. They are held anyway: the registration's
+#: lifetime is conceptually tied to the handle, and relying on the absence of a
+#: finalizer is the kind of assumption that quietly stops being true.
+_handles: list = []
+
 
 def _site_packages() -> list[Path]:
     paths = []
@@ -120,7 +129,7 @@ def ensure_cuda_dlls(force: bool = False) -> list[str]:
         if family in claimed:
             continue
         try:
-            os.add_dll_directory(str(d))
+            _handles.append(os.add_dll_directory(str(d)))
         except (OSError, AttributeError):
             continue
         claimed.add(family)

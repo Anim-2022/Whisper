@@ -4,7 +4,7 @@
 
 **Offline-first desktop GUI for local speech-to-text transcription**
 
-[![Python](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python)](https://www.python.org/)
+[![Python](https://img.shields.io/badge/Python-3.11%2B-blue?logo=python)](https://www.python.org/)
 [![Engine](https://img.shields.io/badge/Engine-faster--whisper-orange)](https://github.com/SYSTRAN/faster-whisper)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Windows-0078d7?logo=windows)](https://www.microsoft.com/)
@@ -44,7 +44,7 @@
 | Component | Minimum |
 |-----------|---------|
 | OS | Windows 10 / 11 |
-| Python | 3.10 or newer (developed on 3.12) |
+| Python | 3.11 or newer (CI tests 3.12) |
 | RAM | 8 GB |
 | GPU | NVIDIA GPU, CUDA 12 *(recommended)* |
 | VRAM | 2 GB for `whisper-medium`, 4 GB+ for `large` |

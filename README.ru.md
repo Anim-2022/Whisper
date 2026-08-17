@@ -4,7 +4,7 @@
 
 **Офлайн-приложение с графическим интерфейсом для локальной расшифровки речи**
 
-[![Python](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python)](https://www.python.org/)
+[![Python](https://img.shields.io/badge/Python-3.11%2B-blue?logo=python)](https://www.python.org/)
 [![Engine](https://img.shields.io/badge/Engine-faster--whisper-orange)](https://github.com/SYSTRAN/faster-whisper)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Windows-0078d7?logo=windows)](https://www.microsoft.com/)
@@ -44,7 +44,7 @@
 | Компонент | Минимум |
 |-----------|---------|
 | ОС | Windows 10 / 11 |
-| Python | 3.10 или новее (разрабатывалось на 3.12) |
+| Python | 3.11 или новее (CI проверяет 3.12) |
 | ОЗУ | 8 ГБ |
 | Видеокарта | NVIDIA, CUDA 12 *(рекомендуется)* |
 | Видеопамять | 2 ГБ для `whisper-medium`, 4 ГБ+ для `large` |
