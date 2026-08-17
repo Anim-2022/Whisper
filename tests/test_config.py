@@ -64,6 +64,22 @@ def test_batched_mode_clears_options_it_would_discard():
     assert any("batched mode ignores" in n for n in c.notes)
 
 
+def test_batched_without_vad_falls_back_to_sequential():
+    """The batched pipeline derives clip timestamps from VAD and raises without it.
+
+    Turning VAD back on would override an explicit choice, so the mode gives way
+    instead. Before this, unticking "Enable VAD" in batched mode crashed the run
+    with "No clip timestamps found".
+    """
+    c = cfg(batched=True, vad_filter=False)
+    assert c.batched is False
+    assert any("requires VAD" in n for n in c.notes)
+
+
+def test_batched_with_vad_stays_batched():
+    assert cfg(batched=True, vad_filter=True).batched is True
+
+
 def test_batched_warns_when_subtitles_are_requested():
     """A 30 s cue is a fine transcript line and a useless subtitle."""
     c = cfg(batched=True, formats=("txt", "srt"))

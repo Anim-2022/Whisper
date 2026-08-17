@@ -119,6 +119,14 @@ class TranscriptionConfig:
 
         notes = list(self.notes)
 
+        # BatchedInferencePipeline derives its clip timestamps from VAD and
+        # raises "No clip timestamps found" without it. Turning VAD back on would
+        # contradict an explicit choice, so honour the choice and drop to the
+        # sequential path, which transcribes the audio unsegmented as asked.
+        if self.batched and not self.vad_filter:
+            self.batched = False
+            notes.append("batched mode requires VAD; switching to sequential mode")
+
         # faster-whisper applies the hallucination filter only inside the
         # word-timestamp code path, so asking for one without the other silently
         # does nothing. Couple them rather than let the UI claim it is active.
