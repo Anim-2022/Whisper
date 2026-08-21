@@ -5,11 +5,12 @@ and as a smoke test of the engine without launching the GUI.
 
     python transcribe_cli.py audio/                     --formats txt,srt
     python transcribe_cli.py audio/meeting.m4a          --model whisper-medium
-    python transcribe_cli.py audio/ --preset accurate   --out predictions/new
+    python transcribe_cli.py audio/ --preset difficult  --out predictions/new
 """
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 import time
 from pathlib import Path
@@ -44,8 +45,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("inputs", nargs="*", default=["audio"],
                    help="audio files and/or directories (default: audio/)")
     p.add_argument("--model", default=None, help=f"default: {C.DEFAULT_MODEL}")
-    p.add_argument("--preset", default="accurate", choices=list(C.PRESETS),
-                   help="default: accurate")
+    p.add_argument("--preset", default=C.DEFAULT_PRESET, choices=list(C.PRESETS),
+                   help=f"default: {C.DEFAULT_PRESET}")
     p.add_argument("--lang", default="ru")
     p.add_argument("--auto-lang", action="store_true")
     p.add_argument("--formats", default="txt",
@@ -89,8 +90,14 @@ def main(argv: list[str] | None = None) -> int:
     print(f"{len(files)} file(s) -> {config.output_dir}")
     print(f"preset={args.preset}  {config.describe()}")
 
+    # Problems are printed even with --quiet: a run that fails silently and still
+    # reports a total looks like success, which is how someone concludes the tool
+    # is broken and gives up.
+    problem = re.compile(r"error|failed|fail|falling back|no speech|missing",
+                         re.IGNORECASE)
+
     def on_log(message: str) -> None:
-        if not args.quiet:
+        if not args.quiet or problem.search(message):
             print(message, flush=True)
 
     def on_progress(_fraction: float, status: str) -> None:

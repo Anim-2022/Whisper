@@ -149,7 +149,12 @@ def main(argv: list[str] | None = None) -> int:
     ct2_root: Path = args.out or (models_root / "ct2")
 
     if not models_root.is_dir():
-        print(f"models root not found: {models_root}")
+        print(f"No HuggingFace weights found at {models_root}")
+        print()
+        print("This tool converts weights you already have on disk. If you just")
+        print("want a model to use, download a ready-made one instead — no torch")
+        print("and no conversion needed:")
+        print("    python tools/download_model.py")
         return 2
 
     print(f"Scanning {models_root}")
@@ -158,7 +163,9 @@ def main(argv: list[str] | None = None) -> int:
         candidates = [c for c in candidates if args.only in c.name]
 
     if not candidates:
-        print("Nothing to convert.")
+        print("Nothing to convert — no models--*/snapshots/ directories found.")
+        print("To download a ready-made model instead:")
+        print("    python tools/download_model.py")
         return 1
 
     if args.list:

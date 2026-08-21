@@ -30,6 +30,20 @@ ShouldStop = Callable[[], bool]
 #: thousands of segments; without throttling the GUI queue becomes the bottleneck.
 PROGRESS_INTERVAL_SEC = 0.25
 
+#: Substrings that mark a CUDA library problem rather than a genuine model error.
+#: CTranslate2 reports these as plain RuntimeError, so the text is all there is.
+_CUDA_ERROR_MARKERS = (
+    "cublas", "cudnn", "cuda", "cudart", "no kernel image",
+    "gpu", "device kernel image",
+)
+
+
+def is_cuda_library_error(exc: BaseException) -> bool:
+    """Is this failure about CUDA libraries rather than the audio or the model?"""
+    text = str(exc).lower()
+    return any(marker in text for marker in _CUDA_ERROR_MARKERS)
+
+
 
 class WhisperEngine:
     """Loads a CTranslate2 Whisper model and transcribes files with it."""
@@ -48,6 +62,9 @@ class WhisperEngine:
         # the slow failing CUDA load before falling back once more.
         self._requested_device: str | None = None
         self._requested_compute_type: str | None = None
+        # Set once a CUDA failure has been seen, so the rest of the session goes
+        # straight to CPU instead of repeating a load that is known to fail.
+        self._force_cpu = False
 
     # -- helpers -----------------------------------------------------------
     def log(self, message: str) -> None:
@@ -103,6 +120,9 @@ class WhisperEngine:
         self.log(f"  {config.describe()}")
 
         device, compute_type = config.device, config.compute_type
+        if self._force_cpu and device == "cuda":
+            device, compute_type = "cpu", "int8"
+            self.log("  CUDA already failed once this session; loading on CPU")
         t0 = time.monotonic()
         try:
             model = WhisperModel(str(model_dir), device=device,
@@ -172,36 +192,10 @@ class WhisperEngine:
                 kwargs["hallucination_silence_threshold"] = config.hallucination_silence_threshold
         return kwargs
 
-    def transcribe_file(
-        self,
-        path: Path,
-        config: TranscriptionConfig,
-        on_segment: SegmentCallback | None = None,
-        on_percent: Callable[[int], None] | None = None,
-        on_stage: StageCallback | None = None,
-        should_stop: ShouldStop | None = None,
-    ) -> TranscriptResult:
-        """Transcribe one file. Returns whatever was decoded, even if stopped early."""
-        from . import audio as audio_mod
-        from .progress import STAGE_DECODE, STAGE_LANG, STAGE_MODEL
-
-        stop = should_stop or (lambda: False)
-
-        if on_stage:
-            on_stage(STAGE_MODEL)
-        self.load(config)
-        if stop():
-            return self._empty_result(path, config, stopped=True)
-
-        # Decode explicitly rather than handing the path to transcribe(): it gives
-        # a fast, clear failure on unreadable input and a place to boost quiet audio.
-        if on_stage:
-            on_stage(STAGE_DECODE)
-        samples, gain = audio_mod.decode(path, boost_quiet=config.boost_quiet_audio)
-        if gain != 1.0:
-            self.log(f"  quiet recording detected, boosted by {gain:.1f}x")
-        if stop():
-            return self._empty_result(path, config, stopped=True)
+    def _decode(self, samples, config: TranscriptionConfig,
+                on_segment, on_percent, on_stage, stop):
+        """Run the model over decoded audio. Split out so it can be retried on CPU."""
+        from .progress import STAGE_LANG
 
         if on_stage:
             on_stage(STAGE_LANG)
@@ -240,6 +234,60 @@ class WhisperEngine:
 
         if on_percent and not stopped_early:
             on_percent(100)
+
+        return collected, total, after_vad, detected, lang_prob, stopped_early
+
+    def transcribe_file(
+        self,
+        path: Path,
+        config: TranscriptionConfig,
+        on_segment: SegmentCallback | None = None,
+        on_percent: Callable[[int], None] | None = None,
+        on_stage: StageCallback | None = None,
+        should_stop: ShouldStop | None = None,
+    ) -> TranscriptResult:
+        """Transcribe one file. Returns whatever was decoded, even if stopped early."""
+        from . import audio as audio_mod
+        from .progress import STAGE_DECODE, STAGE_MODEL
+
+        stop = should_stop or (lambda: False)
+
+        if on_stage:
+            on_stage(STAGE_MODEL)
+        self.load(config)
+        if stop():
+            return self._empty_result(path, config, stopped=True)
+
+        # Decode explicitly rather than handing the path to transcribe(): it gives
+        # a fast, clear failure on unreadable input and a place to boost quiet audio.
+        if on_stage:
+            on_stage(STAGE_DECODE)
+        samples, gain = audio_mod.decode(path, boost_quiet=config.boost_quiet_audio)
+        if gain != 1.0:
+            self.log(f"  quiet recording detected, boosted by {gain:.1f}x")
+        if stop():
+            return self._empty_result(path, config, stopped=True)
+
+        try:
+            outcome = self._decode(samples, config, on_segment, on_percent, on_stage, stop)
+        except RuntimeError as exc:
+            if self.device != "cuda" or not is_cuda_library_error(exc):
+                raise
+            # CTranslate2 opens cuBLAS and cuDNN lazily, so a missing CUDA library
+            # surfaces here rather than at construction: the model reports itself
+            # ready on the GPU, runs VAD, and only the first encode fails. Without
+            # this the whole run dies on a machine that has an NVIDIA card but not
+            # the GPU extras installed.
+            self.log(f"CUDA failed during decoding: {exc}")
+            self.log(describe_cuda())
+            self.log("Falling back to CPU for the rest of this run. "
+                     "Install requirements-gpu.txt to use the GPU.")
+            self._force_cpu = True
+            self.unload()
+            self.load(config)
+            outcome = self._decode(samples, config, on_segment, on_percent, on_stage, stop)
+
+        collected, total, after_vad, detected, lang_prob, stopped_early = outcome
 
         return TranscriptResult(
             source_path=path,

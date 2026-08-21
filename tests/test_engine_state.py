@@ -37,13 +37,30 @@ def fake_faster_whisper(monkeypatch):
     module = types.ModuleType("faster_whisper")
 
     class Batched:
+        """Mirrors BatchedInferencePipeline: wraps a model and delegates to it."""
+
         def __init__(self, model=None):
             self.model = model
+
+        def transcribe(self, *a, **kw):
+            return self.model.transcribe(*a, **kw)
 
     module.BatchedInferencePipeline = Batched
     module.WhisperModel = FakeModel
     module.__version__ = "1.2.1-fake"
+    # _transcribe_kwargs imports faster_whisper.vad, so the stub needs to be a
+    # package with that submodule, not a bare module.
+    vad = types.ModuleType("faster_whisper.vad")
+
+    class VadOptions:
+        def __init__(self, **kw):
+            self.__dict__.update(kw)
+
+    vad.VadOptions = VadOptions
+    module.vad = vad
+    module.__path__ = []
     monkeypatch.setitem(sys.modules, "faster_whisper", module)
+    monkeypatch.setitem(sys.modules, "faster_whisper.vad", vad)
 
     def use(model_cls):
         module.WhisperModel = model_cls
@@ -154,3 +171,67 @@ def test_non_cuda_failures_are_not_swallowed(fake_faster_whisper, model_dir):
     fake_faster_whisper(AlwaysFails)
     with pytest.raises(RuntimeError, match="corrupt model file"):
         WhisperEngine().load(cfg(device="cpu"))
+
+
+class LazyCudaFailure(FakeModel):
+    """Loads happily on CUDA and fails on the first encode, like a missing cuBLAS.
+
+    CTranslate2 opens cuBLAS and cuDNN lazily, so this is what a machine with an
+    NVIDIA card but no GPU extras installed actually does — the constructor
+    succeeds and the failure arrives one layer later.
+    """
+
+    def transcribe(self, *a, **kw):
+        if self.device == "cuda":
+            raise RuntimeError("Library cublas64_12.dll is not found or cannot be loaded")
+        return iter(()), _FakeInfo()
+
+
+class _FakeInfo:
+    duration = 1.0
+    duration_after_vad = 1.0
+    language = "de"
+    language_probability = 0.9
+
+
+def test_cuda_failure_during_decoding_falls_back_to_cpu(
+        fake_faster_whisper, model_dir, pretend_cuda, monkeypatch, tmp_path):
+    """The constructor-only fallback did not cover this and the whole run died."""
+    import numpy as np
+
+    fake_faster_whisper(LazyCudaFailure)
+    monkeypatch.setattr("whisper_engine.audio.decode",
+                        lambda path, boost_quiet=True: (np.zeros(16000, dtype=np.float32), 1.0))
+
+    logs = []
+    engine = WhisperEngine(on_log=logs.append)
+    audio = tmp_path / "a.wav"
+    audio.write_bytes(b"")
+
+    result = engine.transcribe_file(audio, cfg(device="cuda", compute_type="float16"))
+
+    assert engine.device == "cpu"
+    assert result.engine_info["device"] == "cpu"
+    assert any("CUDA failed during decoding" in line for line in logs)
+
+
+def test_a_second_file_does_not_retry_cuda_after_a_decode_failure(
+        fake_faster_whisper, model_dir, pretend_cuda, monkeypatch, tmp_path):
+    import numpy as np
+
+    fake_faster_whisper(LazyCudaFailure)
+    monkeypatch.setattr("whisper_engine.audio.decode",
+                        lambda path, boost_quiet=True: (np.zeros(16000, dtype=np.float32), 1.0))
+
+    engine = WhisperEngine()
+    audio = tmp_path / "a.wav"
+    audio.write_bytes(b"")
+    config = cfg(device="cuda", compute_type="float16")
+
+    engine.transcribe_file(audio, config)
+    before = FakeModel.instances
+    engine.transcribe_file(audio, config)
+
+    # The second file reuses the CPU model rather than retrying the GPU.
+    assert FakeModel.instances == before
+    assert engine.device == "cpu"

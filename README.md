@@ -60,7 +60,10 @@ by `whisper_engine/cuda_dlls.py`.
 
 ## ⚡ Quick Start
 
-### 1. Clone the repository
+Four commands from a clean machine to a working transcript. If any of them fails,
+[Troubleshooting](#-troubleshooting) covers what people actually hit.
+
+### 1. Get the code
 
 ```bash
 git clone https://github.com/Anim-2022/Whisper.git
@@ -74,58 +77,120 @@ python -m venv .venv
 .venv\Scripts\activate
 ```
 
-### 3. Install dependencies
+Windows PowerShell uses `.venv\Scripts\Activate.ps1`; on Linux or macOS it is
+`source .venv/bin/activate`. Your prompt should now start with `(.venv)`.
 
-There are four requirements files, each with a distinct job:
+Python 3.11 or newer is required — check with `python --version`.
 
-| File | When you need it |
-|------|------------------|
-| `requirements.txt` | Always — the runtime |
-| `requirements-gpu.txt` | For CUDA acceleration (cuBLAS + cuDNN wheels) |
-| `requirements-convert.txt` | Once, to convert models. Pulls in torch and transformers |
-| `requirements-dev.txt` | Only to run the tests and linter |
+### 3. Install
 
 ```bash
-pip install -r requirements.txt -r requirements-gpu.txt
+pip install -r requirements.txt
 ```
 
-### 4. Get a model and convert it
+Add GPU acceleration if you have an NVIDIA card. It is optional; without it
+everything still works, just slower:
 
-The engine uses CTranslate2 format, not HuggingFace safetensors. Download a
-Whisper model from Hugging Face into `models/`, then convert it once:
+```bash
+pip install -r requirements-gpu.txt
+```
+
+### 4. Download a model
+
+```bash
+python tools/download_model.py
+```
+
+That fetches `whisper-medium` (~1.5 GB), the recommended default, into
+`models/ct2/`. It is already in the format the engine uses, so nothing needs to
+be converted and torch is never installed.
+
+See the other options with `python tools/download_model.py --list`, or name one
+directly: `python tools/download_model.py small`.
+
+> **This is the only step that uses the internet.** Once the model is on disk the
+> application never reaches the network again — it loads with `local_files_only`.
+
+### 5. Run
+
+```bash
+Start_Whisper.bat
+```
+
+or, without the interface:
+
+```bash
+python transcribe_cli.py path/to/audio --formats txt,md
+```
+
+In the window: pick the folder holding your recordings, pick the language, press
+**Start**. Transcripts land in `audio_to_text/`.
+
+<details>
+<summary><b>Already have HuggingFace Whisper weights on disk?</b></summary>
+
+Then you can convert them yourself instead of downloading, which keeps the whole
+setup offline. This is the only situation that needs torch and transformers:
 
 ```bash
 pip install -r requirements-convert.txt
-python tools/convert_models.py
+python tools/convert_models.py --list     # see what was found
+python tools/convert_models.py            # convert everything
 ```
 
-This scans `models/models--*/snapshots/*`, writes converted models to
-`models/ct2/<name>/`, and runs entirely offline against the weights you already
-have. Check what it found first with `python tools/convert_models.py --list`.
+The tool looks for the HuggingFace cache layout — `models/models--<org>--<name>/snapshots/<hash>/`
+— which is what `huggingface-cli download openai/whisper-medium --cache-dir models`
+produces. Converted models are written to `models/ct2/<name>/`.
 
-`whisper-medium` is the recommended default — see [Choosing a model](#-choosing-a-model).
+Conversion copies `tokenizer.json` and `preprocessor_config.json` next to the
+weights, and refuses to run without them. Both matter: missing the first, the
+engine silently reaches out to the network; missing the second, a 128-mel model
+such as `large-v3` is decoded as 80 mel bins and quietly produces nonsense.
 
-> Conversion copies `tokenizer.json` and `preprocessor_config.json` alongside the
-> weights. Both matter: without the first, the engine silently reaches out to the
-> network; without the second, a 128-mel model such as `large-v3` decodes as 80 mel
-> bins and quietly produces garbage. The converter refuses to proceed without them.
+Afterwards the original `models--*` folders are only needed to convert again, and
+can be deleted.
 
-Once converted, the original `models--*` folders are only needed if you want to
-re-convert, and can be deleted to reclaim disk space.
+</details>
 
-### 5. Launch
+### The four requirements files
 
-```bash
-Start_Whisper.bat        # double-click or run in terminal
-# or
-python start_gui.py
-```
+| File | When |
+|------|------|
+| `requirements.txt` | Always — the runtime |
+| `requirements-gpu.txt` | NVIDIA GPU acceleration (cuBLAS + cuDNN) |
+| `requirements-convert.txt` | Only to convert your own HuggingFace weights |
+| `requirements-dev.txt` | Only to run the tests and linter |
 
-Or headless:
+---
 
-```bash
-python transcribe_cli.py audio/ --formats txt,md --out audio_to_text
-```
+## 🩺 Troubleshooting
+
+**`Could not open requirements file: requirements.txt`**
+You are not in the project folder. `cd` into the cloned `Whisper` directory —
+`dir` (or `ls`) should show `requirements.txt`.
+
+**`No models installed yet` / the model list is empty**
+Run `python tools/download_model.py`. The Refresh button next to the model box
+rescans `models/ct2/` without restarting the app.
+
+**`python` is not recognised, or reports 3.10 or older**
+Install Python 3.11+ from python.org with "Add Python to PATH" ticked, then
+recreate the environment with `py -3.12 -m venv .venv`.
+
+**Transcription runs on the CPU although you have an NVIDIA card**
+Install `requirements-gpu.txt`. The Logs tab prints which CUDA directories were
+registered at startup, and says explicitly when it falls back to CPU.
+
+**`Library cublas64_12.dll is not found`**
+Same cause — the CUDA libraries are missing. `pip install -r requirements-gpu.txt`.
+
+**It is very slow**
+Check the Logs tab for `cpu` in the model line. On CPU a long recording takes
+many times longer; either install the GPU extras or pick a smaller model.
+
+**Out of memory on the GPU**
+Lower **Batch size** in the Advanced tab, or set **Compute type** to
+`int8_float16`, which roughly halves VRAM use.
 
 ---
 
@@ -149,6 +214,7 @@ Whisper/
 ├── gui/                     # GUI package: constants, i18n, settings, widgets
 ├── start_gui.py             # Entry point
 ├── transcribe_cli.py        # Headless runner
+├── tools/download_model.py  # Download a ready-made model (the easy path)
 ├── tools/convert_models.py  # One-time HF → CTranslate2 conversion
 ├── evaluate_transcriptions.py  # WER/CER evaluation tool
 ├── tests/                   # pytest suite (no GPU or weights required)

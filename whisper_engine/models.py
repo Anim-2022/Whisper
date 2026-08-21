@@ -68,8 +68,19 @@ def discover_ct2_models(root: Path | None = None) -> list[str]:
 
 
 def conversion_hint(model_id: str) -> str:
-    return (f"Convert it first:\n"
-            f"    python tools/convert_models.py --only {model_id}")
+    """Both ways to obtain a model, download first.
+
+    Pointing only at the converter is a dead end on a fresh install: it has
+    nothing to convert and says so, which leaves the user going in circles.
+    """
+    short = model_id.replace("whisper-", "") or "medium"
+    return (
+        "Get it with either:\n"
+        f"    python tools/download_model.py {short}"
+        "        (a ready-made model, no torch needed)\n"
+        f"    python tools/convert_models.py --only {model_id}"
+        "   (converts HuggingFace weights you already have)"
+    )
 
 
 def validate_ct2_dir(path: Path, model_id: str = "") -> None:
