@@ -965,7 +965,7 @@ class WhisperGUI(ctk.CTk):
     def _load_persisted_settings(self):
         """Apply ~/.whisper_gui/settings.json on top of preset-fast defaults.
 
-        This runs after build_*_tab and apply_preset("fast"), so individual
+        This runs after build_*_tab and the default preset is applied, so individual
         keys override the preset baseline and missing keys keep the baseline.
         Never raises: on any malformed value we silently fall through.
         """

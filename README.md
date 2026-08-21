@@ -17,15 +17,15 @@
 
 ## ✨ Features
 
-- **100% offline** — no API keys, no internet required after the model is converted
-- **faster-whisper (CTranslate2)** — around 60× realtime on a 16 GB consumer GPU; a 2 h 52 m recording transcribes in about 2.5 minutes
+- **100% offline** — no API keys. The only step that uses the network is fetching the model once
+- **faster-whisper (CTranslate2)** — 16–26× realtime with the default preset on a 16 GB consumer GPU, and 53–60× in the long-recording preset, which turns a 2 h 52 m file into about 2.5 minutes
 - **Reads what your meetings actually produce** — `m4a`, `mp4`, `webm`, `mkv`, `opus` and more, via bundled FFmpeg. No system install needed
 - **Silero VAD** — bundled with the engine; skips silence, which is both faster and less prone to hallucinated text
 - **GPU / CPU** — CUDA acceleration with an automatic CPU fallback if the GPU cannot be brought up
 - **Batch processing** — point it at a folder and walk away
 - **Five output formats** — TXT, SRT, VTT, JSON with timings and quality metrics, and a Markdown meeting protocol
 - **Bilingual UI** — English and Russian, switchable in one click
-- **3 presets** — Fast · Accurate · Noisy audio
+- **3 presets** — Meeting · Long recording · Difficult audio, each chosen from measurements
 - **Vocabulary hint** — seed the decoder with attendee names and jargon so it spells them correctly
 - **Persistent settings** — restored next launch from `~/.whisper_gui/settings.json`
 - **Field validation** — out-of-range numbers turn red and block Start with an explanation
@@ -306,11 +306,15 @@ graph LR
 
 ## 🎛️ Presets
 
-| Preset | Mode | Best for |
-|--------|------|----------|
-| **Fast** | Batched, beam 1 | Drafts and quick passes over long archives |
-| **Accurate** *(default)* | Batched, beam 5 | Everyday use. Fast enough that there is no real trade-off against Fast |
-| **Noisy audio** | Sequential, beam 5 | Messy recordings, and anything where you need subtitle-grade timing |
+| Preset | Mode | Speed | Best for |
+|--------|------|-------|----------|
+| **Meeting** *(default)* | Sequential, beam 5 | 16–26× | Everyday use. The most complete text and 3–5 s segments, so one run serves as a transcript *and* as subtitles |
+| **Long recording** | Batched, beam 5 | 53–60× | Multi-hour archives. Pays for it with ~30 s segments, unusable as subtitles, and the occasional word lost where two windows meet |
+| **Difficult audio** | Sequential, beam 5 | 15–25× | Quiet rooms, distant microphones. Recovers ~4 % more transcript by keeping faint speech the default discards |
+
+Values come from a benchmark sweep rather than intuition. The comments above
+`PRESETS` in `gui/constants.py` record what was measured, and — just as usefully —
+which knobs were tried and rejected because they changed nothing.
 
 ---
 
