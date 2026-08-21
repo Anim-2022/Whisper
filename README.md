@@ -4,7 +4,8 @@
 
 **Offline-first desktop GUI for local speech-to-text transcription**
 
-[![Python](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python)](https://www.python.org/)
+[![Python](https://img.shields.io/badge/Python-3.11%2B-blue?logo=python)](https://www.python.org/)
+[![Engine](https://img.shields.io/badge/Engine-faster--whisper-orange)](https://github.com/SYSTRAN/faster-whisper)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Windows-0078d7?logo=windows)](https://www.microsoft.com/)
 
@@ -16,20 +17,25 @@
 
 ## ✨ Features
 
-- **100% offline** — no API keys, no internet required after model download
-- **Silero VAD** — intelligent voice activity detection skips silence automatically
-- **GPU / CPU support** — CUDA acceleration for NVIDIA GPUs, CPU fallback included
-- **Batch processing** — drop a whole folder of audio files and process them all at once
-- **SRT subtitle output** — optional timestamped subtitle files alongside plain text
-- **Bilingual UI** — switch between English and Russian in one click
-- **3 presets** — Fast · Accurate · Noisy audio, covering everyday use cases
-- **Persistent settings** — last folder, model, preset, theme, and tweaked fields are restored next launch (`~/.whisper_gui/settings.json`)
-- **Field validation** — out-of-range numbers turn the field red and block Start with a banner explaining what to fix
-- **Error banner & per-file ETA** — problems and "File 2/5 — ETA 0:42" are surfaced above the tabs, no need to open the Logs tab
-- **Hotkeys** — `F5` start, `Esc` stop, `Ctrl+O` audio folder, `Ctrl+L` logs tab, `Ctrl+Q` quit
-- **Result preview & quick open** — sidebar buttons to open the output folder or read the latest transcript in a popup (copy / save-as)
+- **100% offline** — no API keys, no internet required after the model is converted
+- **faster-whisper (CTranslate2)** — around 60× realtime on a 16 GB consumer GPU; a 2 h 52 m recording transcribes in about 2.5 minutes
+- **Reads what your meetings actually produce** — `m4a`, `mp4`, `webm`, `mkv`, `opus` and more, via bundled FFmpeg. No system install needed
+- **Silero VAD** — bundled with the engine; skips silence, which is both faster and less prone to hallucinated text
+- **GPU / CPU** — CUDA acceleration with an automatic CPU fallback if the GPU cannot be brought up
+- **Batch processing** — point it at a folder and walk away
+- **Five output formats** — TXT, SRT, VTT, JSON with timings and quality metrics, and a Markdown meeting protocol
+- **Bilingual UI** — English and Russian, switchable in one click
+- **3 presets** — Fast · Accurate · Noisy audio
+- **Vocabulary hint** — seed the decoder with attendee names and jargon so it spells them correctly
+- **Persistent settings** — restored next launch from `~/.whisper_gui/settings.json`
+- **Field validation** — out-of-range numbers turn red and block Start with an explanation
+- **Error banner & per-file ETA** — "File 2/5 — ETA 0:42" above the tabs, no need to open Logs
+- **Stop is safe** — stopping mid-file writes a `.partial` transcript instead of discarding the work
+- **Hotkeys** — `F5` start, `Esc` stop, `Ctrl+O` audio folder, `Ctrl+L` logs, `Ctrl+Q` quit
+- **Result preview & quick open** — read the latest transcript in a popup, or jump to the output folder
 - **Drag & drop** (optional) — install `windnd` and drop a file or folder onto the audio path
 - **WER / CER evaluation** — built-in script to measure transcription quality
+- **Headless CLI** — `transcribe_cli.py` for batch jobs and scripting
 
 ---
 
@@ -38,13 +44,17 @@
 | Component | Minimum |
 |-----------|---------|
 | OS | Windows 10 / 11 |
-| Python | 3.10 or newer |
+| Python | 3.11 or newer (CI tests 3.12) |
 | RAM | 8 GB |
-| GPU | NVIDIA GPU with CUDA 12.4 *(recommended)* |
-| VRAM | 4 GB for `whisper-medium`, 10 GB+ for `large` |
-| Storage | ~3 GB per Whisper model |
+| GPU | NVIDIA GPU, CUDA 12 *(recommended)* |
+| VRAM | 2 GB for `whisper-medium`, 4 GB+ for `large` |
+| Storage | ~1.5 GB per converted model, plus ~2.3 GB for the environment |
 
-> **CPU-only mode works**, but is significantly slower — expect 5–10× longer processing times.
+> **CPU-only mode works** and is selected automatically when no GPU is available, but expect it to be many times slower on long recordings.
+
+CUDA does **not** need a system-wide toolkit install: the required cuBLAS and cuDNN
+libraries come from pip wheels (`requirements-gpu.txt`) and are wired up at startup
+by `whisper_engine/cuda_dlls.py`.
 
 ---
 
@@ -66,40 +76,55 @@ python -m venv .venv
 
 ### 3. Install dependencies
 
-```bash
-pip install -r requirements.txt
-```
+There are four requirements files, each with a distinct job:
 
-> PyTorch with CUDA 12.4 is pulled automatically via the extra index URL already set in `requirements.txt`.
-
-### 4. Download a Whisper model
-
-Download from [Hugging Face — openai/whisper-medium](https://huggingface.co/openai/whisper-medium) and place it under:
-
-```
-models/
-└── models--openai--whisper-medium/
-    ├── refs/
-    └── snapshots/
-        └── <hash>/          ← model files go here
-```
-
-Alternatively, on first run the app will show you the expected path in the **Model** section.
-
-### 5. (Optional) Download Silero VAD
+| File | When you need it |
+|------|------------------|
+| `requirements.txt` | Always — the runtime |
+| `requirements-gpu.txt` | For CUDA acceleration (cuBLAS + cuDNN wheels) |
+| `requirements-convert.txt` | Once, to convert models. Pulls in torch and transformers |
+| `requirements-dev.txt` | Only to run the tests and linter |
 
 ```bash
-git clone https://github.com/snakers4/silero-vad.git models/silero-vad
+pip install -r requirements.txt -r requirements-gpu.txt
 ```
 
-VAD greatly improves segmentation quality. Without it the app falls back to a simple sliding window.
+### 4. Get a model and convert it
 
-### 6. Launch
+The engine uses CTranslate2 format, not HuggingFace safetensors. Download a
+Whisper model from Hugging Face into `models/`, then convert it once:
+
+```bash
+pip install -r requirements-convert.txt
+python tools/convert_models.py
+```
+
+This scans `models/models--*/snapshots/*`, writes converted models to
+`models/ct2/<name>/`, and runs entirely offline against the weights you already
+have. Check what it found first with `python tools/convert_models.py --list`.
+
+`whisper-medium` is the recommended default — see [Choosing a model](#-choosing-a-model).
+
+> Conversion copies `tokenizer.json` and `preprocessor_config.json` alongside the
+> weights. Both matter: without the first, the engine silently reaches out to the
+> network; without the second, a 128-mel model such as `large-v3` decodes as 80 mel
+> bins and quietly produces garbage. The converter refuses to proceed without them.
+
+Once converted, the original `models--*` folders are only needed if you want to
+re-convert, and can be deleted to reclaim disk space.
+
+### 5. Launch
 
 ```bash
 Start_Whisper.bat        # double-click or run in terminal
 # or
 python start_gui.py
+```
+
+Or headless:
+
+```bash
+python transcribe_cli.py audio/ --formats txt,md --out audio_to_text
 ```
 
 ---
@@ -108,13 +133,26 @@ python start_gui.py
 
 ```
 Whisper/
-├── whisper_core.py          # Core engine: VAD, segmentation, batching, OOM handling
+├── whisper_engine/          # Engine package
+│   ├── engine.py            #   faster-whisper adapter (the only faster_whisper import)
+│   ├── config.py            #   TranscriptionConfig
+│   ├── models.py            #   local CT2 model discovery and validation
+│   ├── audio.py             #   PyAV decoding, format list
+│   ├── writers.py           #   TXT / SRT / VTT / JSON / Markdown
+│   ├── progress.py          #   the single owner of every status string
+│   ├── timestamps.py        #   subtitle timestamp formatting
+│   ├── types.py             #   TranscriptResult / TranscriptSegment
+│   ├── device.py            #   CUDA probing without torch
+│   └── cuda_dlls.py         #   Windows CUDA DLL discovery
+├── whisper_core.py          # Batch orchestration over the engine
 ├── whisper_gui.py           # CustomTkinter GUI (EN/RU bilingual)
+├── gui/                     # GUI package: constants, i18n, settings, widgets
 ├── start_gui.py             # Entry point
+├── transcribe_cli.py        # Headless runner
+├── tools/convert_models.py  # One-time HF → CTranslate2 conversion
 ├── evaluate_transcriptions.py  # WER/CER evaluation tool
-├── Start_Whisper.bat        # Windows launcher
-├── requirements.txt         # Python dependencies
-├── models/                  # ← Put Whisper + Silero VAD models here (not in repo)
+├── tests/                   # pytest suite (no GPU or weights required)
+├── models/ct2/              # ← Converted models go here (not in repo)
 ├── audio/                   # ← Default input folder (not in repo)
 └── audio_to_text/           # ← Default output folder (not in repo)
 ```
@@ -128,96 +166,101 @@ Whisper/
 ```mermaid
 graph TD
     A["User"] -->|"Settings"| B("Whisper GUI")
-    B -->|"Config"| C["WhisperCore"]
-    
-    subgraph step1 ["1. Prep"]
-        C --> D["Load Audio<br/>(soundfile)"]
-        D --> E["Remove<br/>DC Offset"]
-        E --> F["Loudness<br/>Normalization"]
-        F --> G["Resample<br/>to 16 kHz"]
+    B -->|"TranscriptionConfig"| C["WhisperCore"]
+
+    subgraph step1 ["1. Decode"]
+        C --> D["PyAV / FFmpeg<br/>any container"]
+        D --> E["16 kHz mono<br/>float32"]
     end
-    
-    subgraph step2 ["2. Segmentation"]
-        G --> H{"VAD Found?"}
-        H -->|"Yes"| I["Silero VAD<br/>finds speech"]
-        H -->|"No"| J["Sliding<br/>Window"]
-        I --> K["Merge<br/>small segments"]
-        J --> K
-        K --> L["Split<br/>long parts"]
+
+    subgraph step2 ["2. Speech detection"]
+        E --> F["Silero VAD<br/>(bundled ONNX)"]
+        F --> G["Speech regions<br/>+ padding"]
     end
-    
+
     subgraph step3 ["3. Inference"]
-        L --> M["Build<br/>Batches"]
-        M --> N["Whisper<br/>Processor"]
-        N --> O["Token<br/>Generation"]
-        
-        O -->|"OOM Error"| P["Clear<br/>GPU Cache"]
-        P --> Q["Split<br/>into 2 parts"]
-        Q --> O
-        
-        O -->|"Success"| R["Decode<br/>into text"]
+        G --> H{"Mode?"}
+        H -->|"Batched"| I["Pack into parallel<br/>30 s windows"]
+        H -->|"Sequential"| J["One window<br/>at a time"]
+        I --> K["CTranslate2<br/>decode"]
+        J --> K
+        K --> L{"Degenerate?"}
+        L -->|"compression ratio<br/>or logprob"| M["Retry at higher<br/>temperature"]
+        M --> K
+        L -->|"OK"| N["Segments with<br/>timestamps"]
     end
-    
-    subgraph step4 ["4. Finalization"]
-        R --> S{"Boundary<br/>check"}
-        S -->|"Complex"| T["Fuzzy / Word<br/>overlap"]
-        S -->|"Sentence end"| U["Standard<br/>join"]
-        T --> V
-        U --> V
-        V["Write<br/>txt and srt"]
+
+    subgraph step4 ["4. Output"]
+        N --> O["Restore original<br/>timeline"]
+        O --> P["TXT · SRT · VTT<br/>JSON · Markdown"]
     end
-    
-    V --> A
+
+    P --> A
+    N -.->|"live text"| B
 ```
 
-### Segmentation Comparison
+Timestamps are mapped back to the original timeline after VAD, so progress
+reporting and subtitle timings stay correct even though silence was removed
+before decoding.
 
-| Feature | 🚀 Silero VAD (Recommended) | 🪟 Sliding Window (Fallback) |
+### Batched vs Sequential
+
+| | 🚀 Batched *(default)* | 🎯 Sequential |
 | :--- | :--- | :--- |
-| **Method** | Neural network detects voice and extracts only speech segments | Strict mathematical chunking (e.g. 20s each) |
-| **Silence handling** | Ignored, which saves VRAM and time | Passed to Whisper, risk of model hallucinations |
-| **Boundary stitching**| Rarely needed, since phrases are extracted intact | Requires Overlap to avoid cutting words in half |
-| **Timestamp accuracy**| Highest: `.srt` line starts precisely with voice | Average: tied to strict chunk boundaries |
-| **Resource usage**| Adaptive (depends on the actual sentence length) | Strictly fixed by chunk size |
+| **Speed** | Several times faster; packs many 30 s windows into one GPU call | Roughly a quarter of the speed |
+| **Segment length** | One segment per 30 s window | Sentence-level |
+| **Subtitles** | Cues are ~30 s — fine as a transcript, unusable as subtitles | Proper subtitle timing |
+| **Temperature fallback** | Not available | Retries degenerate output at higher temperature |
+| **Previous-text context** | Not available | Optional, improves consistency |
+| **Hallucination filter** | Not available | Drops text invented over long silences |
 
-### Out-of-Memory (OOM) Safe-Fallback
+The application does not pretend otherwise: selecting a batched mode together
+with a sequential-only option raises a warning banner and the option is cleared,
+rather than silently having no effect.
 
-Implemented via recursive `transcribe_chunk_safe()`.
+### Guards against degenerate output
+
+Long recordings are where Whisper misbehaves — repetition loops, and text
+invented over silence. Four independent guards apply:
 
 ```mermaid
-sequenceDiagram
-    participant Core as WhisperCore
-    participant GPU as GPU (VRAM)
-    
-    Core->>GPU: Send large audio chunk
-    
-    alt Enough Memory
-        GPU-->>Core: Return text
-    else RuntimeError (OOM)
-        GPU--xCore: Out Of Memory Error
-        Note over Core: VRAM Fallback
-        Core->>GPU: torch.cuda.empty_cache()
-        Core->>Core: Split audio in half
-        
-        Core->>GPU: Process Left Half
-        GPU-->>Core: Text Left
-        
-        Core->>GPU: Process Right Half
-        GPU-->>Core: Text Right
-        
-        Core->>Core: Intelligent stitching
-    end
+graph LR
+    A["Decoded segment"] --> B{"no_speech_prob<br/>above threshold?"}
+    B -->|"yes"| C["Drop as silence"]
+    B -->|"no"| D{"compression ratio<br/>too high?"}
+    D -->|"yes — repetition loop"| E["Retry hotter"]
+    D -->|"no"| F{"avg logprob<br/>too low?"}
+    F -->|"yes — low confidence"| E
+    F -->|"no"| G{"long silence with<br/>text over it?"}
+    G -->|"yes"| C
+    G -->|"no"| H["Keep"]
 ```
 
 ---
 
 ## 🎛️ Presets
 
-| Preset | Best for |
-|--------|----------|
-| **Fast** *(default)* | Everyday offline transcription, balanced speed and quality |
-| **Accurate** | When wording matters more than speed; uses beam search |
-| **Noisy audio** | Messy recordings with background noise or fragmented speech |
+| Preset | Mode | Best for |
+|--------|------|----------|
+| **Fast** | Batched, beam 1 | Drafts and quick passes over long archives |
+| **Accurate** *(default)* | Batched, beam 5 | Everyday use. Fast enough that there is no real trade-off against Fast |
+| **Noisy audio** | Sequential, beam 5 | Messy recordings, and anything where you need subtitle-grade timing |
+
+---
+
+## 🧠 Choosing a model
+
+| Model | Notes |
+|-------|-------|
+| `whisper-medium` *(default)* | The recommended balance. Keeps punctuation and spells English technical terms correctly |
+| `whisper-small` | Faster and lighter, less accurate on difficult speech |
+| `whisper-large-v3` | Highest quality, heaviest |
+| `whisper-large-v3-turbo` | Fastest, good for drafts. Distilled to four decoder layers: it loses punctuation on long speech and tends to transliterate English terms rather than spell them |
+
+> Measured on ~3 h of Russian lecture audio containing English technical terms,
+> `medium` in batched mode matched or beat the previous transformers-based engine
+> on punctuation density while retaining more English terms — and ran 5.7× faster.
+> `turbo` was faster still but produced one test file with no punctuation at all.
 
 ---
 
@@ -225,19 +268,75 @@ sequenceDiagram
 
 All advanced parameters are accessible from the **Advanced** tab:
 
+### Compute
+
 | Parameter | Description |
 |-----------|-------------|
-| Device | `cuda` / `cpu` / `mps` compute target |
-| Precision | `float16` (GPU, faster) or `float32` (CPU, safer) |
-| Batch size | Chunks processed in parallel — lower if you get VRAM errors |
+| Device | `cuda` or `cpu` |
+| Compute type | `auto` (float16 on GPU, int8 on CPU), `int8_float16` to halve VRAM, `float32` for debugging |
+| Mode | Batched or sequential — see the comparison above |
+| Batch size | 30 s windows decoded together. Lower this first on VRAM errors |
+
+### Voice activity detection
+
+| Parameter | Description |
+|-----------|-------------|
 | VAD threshold | Higher = more aggressive silence cutting |
-| Decode profile | `balanced` or `quality` (beam search, slower) |
-| Target dB | Audio normalization level before transcription |
-| Merge gap | Maximum pause (seconds) to merge adjacent VAD segments |
-| Min silence | Minimum silence (ms) for VAD to split a segment |
-| Chunk sec | Fallback chunk length when VAD is off |
-| Overlap sec | Overlap between chunks to prevent word boundary cuts |
-| Max new tokens | Token limit per chunk — lower reduces hallucinations |
+| Min speech (ms) | Sounds shorter than this are not treated as speech |
+| Min silence (ms) | How long a pause must be before speech is split there |
+| Speech padding (ms) | Audio kept on both sides so syllables are not clipped |
+
+### Decoding
+
+| Parameter | Description |
+|-----------|-------------|
+| Beam size | 1 is fastest, 5 is the usual quality choice |
+| Temperature fallback | Retry degenerate output at higher temperature *(sequential only)* |
+| Previous-text context | Improves consistency, classic cause of repetition loops *(sequential only)* |
+| Word timestamps | Per-word timings in the JSON output |
+| No-speech threshold | Above this probability a segment is dropped as silence |
+| Compression ratio limit | Text compressing better than this is a repetition loop |
+| Log-probability threshold | Low-confidence segments are retried |
+| Hallucination filter (sec) | Drops text over silences longer than this *(sequential only)* |
+
+---
+
+## 📄 Output Formats
+
+| Format | Contents |
+|--------|----------|
+| **TXT** | Plain transcript, split into paragraphs on pauses longer than 2 s |
+| **SRT** | Standard subtitles, `HH:MM:SS,mmm` |
+| **VTT** | WebVTT subtitles, `HH:MM:SS.mmm` |
+| **JSON** | Full structured output — see below |
+| **Markdown** | Readable meeting protocol: metadata table, then 5-minute sections with timestamps |
+
+The JSON schema (`whisper-unified/transcript`, version 1):
+
+```json
+{
+  "schema": "whisper-unified/transcript",
+  "schema_version": 1,
+  "source": { "file": "meeting.m4a", "duration_sec": 10289.0, "duration_after_vad_sec": 8134.2 },
+  "model": { "id": "whisper-medium", "engine": "faster-whisper", "engine_version": "1.2.1",
+             "device": "cuda", "compute_type": "float16" },
+  "language": { "code": "ru", "probability": 0.998, "auto_detected": false },
+  "options": { "batched": true, "beam_size": 5, "vad_filter": true, "...": "..." },
+  "created_at": "2026-08-16T21:14:05+02:00",
+  "stopped_early": false,
+  "segments": [
+    { "id": 1, "start": 0.0, "end": 4.32, "text": "…",
+      "no_speech_prob": 0.02, "avg_logprob": -0.21,
+      "compression_ratio": 1.42, "temperature": 0.0 }
+  ],
+  "text": "full concatenated transcript"
+}
+```
+
+The per-segment quality metrics are there so a bad run can be diagnosed after the
+fact: a high `no_speech_prob` next to confident-looking text is the signature of a
+hallucination over silence, and a `compression_ratio` above ~2.4 marks a
+repetition loop. `words` appears only when word timestamps are enabled.
 
 ---
 
@@ -246,9 +345,7 @@ All advanced parameters are accessible from the **Advanced** tab:
 Compare predicted transcripts against reference texts:
 
 ```bash
-python evaluate_transcriptions.py \
-    --pred-dir audio_to_text/ \
-    --ref-dir  path/to/reference_texts/
+python evaluate_transcriptions.py --pred-dir audio_to_text/ --ref-dir path/to/reference_texts/
 ```
 
 Output:
@@ -268,7 +365,25 @@ Average                               6.950%   2.750%
 
 ## 🔧 Supported Audio Formats
 
-`wav` · `flac` · `mp3` · `ogg` · `m4a` · `opus` · `wma` and any format readable by `soundfile` / `librosa`.
+`wav` · `mp3` · `flac` · `ogg` · `opus` · `m4a` · `mp4` · `aac` · `wma` · `webm` ·
+`mkv` · `mov` · `avi` · `aiff` · `amr` · `3gp`
+
+Decoding goes through PyAV, which bundles FFmpeg — video containers work too, and
+the audio track is extracted automatically. No system FFmpeg install is required.
+
+---
+
+## 🧪 Development
+
+```bash
+pip install -r requirements.txt -r requirements-dev.txt
+pytest
+ruff check .
+```
+
+The test suite runs without a GPU or any model weights: the engine is injected,
+so the whole per-file loop is exercised against a stub. CI runs on Linux and
+Windows.
 
 ---
 

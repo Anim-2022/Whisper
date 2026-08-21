@@ -1,7 +1,7 @@
-# -*- coding: utf-8 -*-
 """Read-only preview window for the latest transcript file.
 
-Lets the user inspect a finished .txt without opening an external editor.
+Lets the user inspect a finished transcript in any of the output formats
+without opening an external editor.
 Three actions: copy all, save as a copy, close. Failures (file vanished,
 permission denied) are surfaced inline at the bottom of the window — we
 never raise back to the caller.
@@ -10,7 +10,6 @@ from __future__ import annotations
 
 from pathlib import Path
 from tkinter import filedialog
-from typing import Optional
 
 import customtkinter as ctk
 
@@ -100,12 +99,20 @@ class PreviewDialog(ctk.CTkToplevel):
             )
 
     def _save_as(self) -> None:
+        # Default to whatever was opened, since the preview now handles every
+        # output format rather than just plain text.
         target = filedialog.asksaveasfilename(
             parent=self,
             title=self._t("preview_save_dialog_title"),
-            defaultextension=".txt",
+            defaultextension=self._path.suffix or ".txt",
             initialfile=self._path.name,
-            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+            filetypes=[
+                ("Text files", "*.txt"),
+                ("Markdown", "*.md"),
+                ("Subtitles", "*.srt *.vtt"),
+                ("JSON", "*.json"),
+                ("All files", "*.*"),
+            ],
         )
         if not target:
             return
@@ -120,7 +127,7 @@ class PreviewDialog(ctk.CTkToplevel):
             )
 
 
-def open_preview(master, path: Optional[Path], t) -> Optional[PreviewDialog]:
+def open_preview(master, path: Path | None, t) -> PreviewDialog | None:
     """Spawn a PreviewDialog if `path` exists; return the window (or None)."""
     if path is None or not Path(path).exists():
         return None

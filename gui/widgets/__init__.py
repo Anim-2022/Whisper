@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Reusable widget builders for the WhisperGUI tabs.
 
 Each `build(app)` function attaches widgets directly onto the `app`

@@ -1,32 +1,35 @@
-# -*- coding: utf-8 -*-
-from tkinter import filedialog, messagebox
-import customtkinter as ctk
 import os
-import subprocess
-import threading
 import queue
 import statistics
+import subprocess
 import sys
+import threading
 import time
-import torch
 from pathlib import Path
-from typing import List, Optional
+from tkinter import filedialog, messagebox
+
+import customtkinter as ctk
 
 try:
-    from whisper_core import WhisperCore, TranscriptionConfig
+    from whisper_core import TranscriptionConfig, WhisperCore
 except ImportError:
     sys.path.append(str(Path(__file__).parent))
-    from whisper_core import WhisperCore, TranscriptionConfig
+    from whisper_core import TranscriptionConfig, WhisperCore
 
 # Single source of truth for theme/colors/sizes/lists/presets lives in gui/.
 from gui import constants as C
 from gui import settings_store
 from gui.i18n import UI_TEXT
-from gui.widgets import settings_tab as settings_tab_builder
 from gui.widgets import advanced_tab as advanced_tab_builder
 from gui.widgets import logs_tab as logs_tab_builder
+from gui.widgets import settings_tab as settings_tab_builder
 from gui.widgets.error_banner import ErrorBanner
 from gui.widgets.preview_dialog import open_preview
+from whisper_engine.audio import find_audio_files
+from whisper_engine.device import has_cuda
+from whisper_engine.models import discover_ct2_models
+from whisper_engine.progress import parse_status
+from whisper_engine.writers import pick_preview
 
 # Optional drag-and-drop support. windnd is Windows-only and tiny; if it
 # isn't installed we silently skip D&D wiring rather than fail to start.
@@ -51,17 +54,23 @@ class WhisperGUI(ctk.CTk):
         self.minsize(*C.WINDOW_MIN_SIZE)
         self.configure(fg_color=C.COLOR_BG)
 
-        self.core = WhisperCore(on_log=self.on_core_log, on_progress=self.on_core_progress)
+        self.core = WhisperCore(
+            on_log=self.on_core_log,
+            on_progress=self.on_core_progress,
+            on_result=self.on_core_result,
+        )
         self.log_queue = queue.Queue()
         self.progress_queue = queue.Queue()
         # Banner messages enqueued from the worker thread; drained on the
         # Tk main thread inside process_queues. Items: (level, message).
-        self.banner_queue: "queue.Queue[tuple[str, str]]" = queue.Queue()
+        self.banner_queue: queue.Queue[tuple[str, str]] = queue.Queue()
+        # Written files reported by the core. Items: (audio_path, [written paths]).
+        self.result_queue: queue.Queue[tuple[Path, list[Path]]] = queue.Queue()
         self.is_running = False
-        self.files_to_process: List[Path] = []
+        self.files_to_process: list[Path] = []
         self.ui_language = C.DEFAULT_UI_LANGUAGE
         self.preset_keys = list(C.PRESET_KEYS)
-        self.decode_profile_keys = list(C.DECODE_PROFILE_KEYS)
+        self.mode_keys = list(C.MODE_KEYS)
         self.localized_help_labels = []
         # Filled by field_factory.make_labeled_entry whenever a validator is
         # passed. start_process iterates this list as a pre-flight check.
@@ -72,13 +81,13 @@ class WhisperGUI(ctk.CTk):
         self.current_file_index = 0
         self.current_file_name = ""
         self._file_started_at = 0.0
-        self._completed_durations: List[float] = []
-        self.has_cuda = torch.cuda.is_available()
-        self.has_local_vad = False
+        self._completed_durations: list[float] = []
+        # Probed via CTranslate2 rather than torch, which is no longer a dependency.
+        self.has_cuda = has_cuda()
         # Phase F: post-run "Open folder" / "View result" need to know what was
         # produced. Updated whenever we see a "Done: <name>" status from core.
-        self.last_output_dir: Optional[Path] = None
-        self.last_result_path: Optional[Path] = None
+        self.last_output_dir: Path | None = None
+        self.last_result_path: Path | None = None
         # Widgets that should grey out while a job is running. Filled below as
         # the sidebar / tabs are built.
         self._input_widgets: list = []
@@ -281,12 +290,12 @@ class WhisperGUI(ctk.CTk):
 
         self.check_hardware()
         self.refresh_local_models()
-        self.set_preset_selection("fast")
-        self.apply_preset("fast")
+        self.set_preset_selection(C.DEFAULT_PRESET)
+        self.apply_preset(C.DEFAULT_PRESET)
 
         # Load persisted user settings (window geometry, last preset, paths,
-        # tweaked numeric fields). This must run AFTER apply_preset("fast") so
-        # individual saved field values can override the preset baseline.
+        # tweaked numeric fields). This must run AFTER the default preset is
+        # applied so individual saved field values override the preset baseline.
         self._load_persisted_settings()
 
         # Persist current values when the user closes the window.
@@ -318,7 +327,7 @@ class WhisperGUI(ctk.CTk):
     def preset_description(self, preset_key: str) -> str:
         return self.t(f"preset_{preset_key}_desc")
 
-    def localized_preset_values(self) -> List[str]:
+    def localized_preset_values(self) -> list[str]:
         return [self.preset_display_text(key) for key in self.preset_keys]
 
     def preset_key_from_value(self, value: str) -> str:
@@ -327,35 +336,35 @@ class WhisperGUI(ctk.CTk):
             for preset_key in self.preset_keys:
                 if normalized == UI_TEXT[language_code][f"preset_{preset_key}"]:
                     return preset_key
-        return "fast"
+        return C.DEFAULT_PRESET
 
     def selected_preset_key(self) -> str:
-        return self.preset_key_from_value(self.combo_preset.get()) if hasattr(self, "combo_preset") else "fast"
+        return self.preset_key_from_value(self.combo_preset.get()) if hasattr(self, "combo_preset") else C.DEFAULT_PRESET
 
     def set_preset_selection(self, preset_key: str):
         if hasattr(self, "combo_preset"):
             self.combo_preset.set(self.preset_display_text(preset_key))
 
-    def decode_profile_label(self, profile_key: str) -> str:
-        return self.t(f"decode_{profile_key}")
+    def mode_label(self, mode_key: str) -> str:
+        return self.t(f"mode_{mode_key}")
 
-    def localized_decode_profile_values(self) -> List[str]:
-        return [self.decode_profile_label(key) for key in self.decode_profile_keys]
+    def localized_mode_values(self) -> list[str]:
+        return [self.mode_label(key) for key in self.mode_keys]
 
-    def decode_profile_key_from_value(self, value: str) -> str:
+    def mode_key_from_value(self, value: str) -> str:
         normalized = value.strip()
         for language_code in UI_TEXT:
-            for profile_key in self.decode_profile_keys:
-                if normalized == UI_TEXT[language_code][f"decode_{profile_key}"]:
-                    return profile_key
-        return "balanced"
+            for mode_key in self.mode_keys:
+                if normalized == UI_TEXT[language_code][f"mode_{mode_key}"]:
+                    return mode_key
+        return "batched"
 
-    def selected_decode_profile_key(self) -> str:
-        return self.decode_profile_key_from_value(self.combo_decode.get()) if hasattr(self, "combo_decode") else "balanced"
+    def selected_mode_key(self) -> str:
+        return self.mode_key_from_value(self.combo_mode.get()) if hasattr(self, "combo_mode") else "batched"
 
-    def set_decode_profile_selection(self, profile_key: str):
-        if hasattr(self, "combo_decode"):
-            self.combo_decode.set(self.decode_profile_label(profile_key))
+    def set_mode_selection(self, mode_key: str):
+        if hasattr(self, "combo_mode"):
+            self.combo_mode.set(self.mode_label(mode_key))
 
     def current_tab_key(self) -> str:
         current_name = self.tabview.get()
@@ -372,22 +381,10 @@ class WhisperGUI(ctk.CTk):
         self.ui_language = new_language
         self.apply_localization()
 
-    def refresh_vad_status_text(self):
-        if not hasattr(self, "check_vad"):
-            return
-
-        if not self.has_local_vad:
-            preferred_vad_path = self.core.vad_repo_hints()[0]
-            self.check_vad.configure(text=self.t("checkbox_enable_vad_missing"))
-            self.vad_hint_label.configure(text=self.t("vad_hint_path", path=preferred_vad_path))
-        else:
-            self.check_vad.configure(text=self.t("checkbox_enable_vad"))
-            self.vad_hint_label.configure(text=self.t("vad_hint_repo", path=self.core.resolve_local_vad_repo()))
-
     def apply_localization(self):
         current_tab = self.current_tab_key()
         current_preset = self.selected_preset_key()
-        current_decode = self.selected_decode_profile_key() if hasattr(self, "combo_decode") else "balanced"
+        current_mode = self.selected_mode_key()
 
         new_tab_names = {
             "settings": self.t("tab_settings"),
@@ -434,8 +431,11 @@ class WhisperGUI(ctk.CTk):
         self.btn_model_folder.configure(text=self.t("button_folder"))
         self.transcription_language_label.configure(text=self.t("label_transcription_language"))
         self.check_auto_lang.configure(text=self.t("checkbox_auto_lang"))
+        self.initial_prompt_label.configure(text=self.t("label_initial_prompt"))
+        self.entry_initial_prompt.configure(placeholder_text=self.t("placeholder_initial_prompt"))
         self.output_section_label.configure(text=self.t("section_output"))
-        self.check_srt.configure(text=self.t("checkbox_srt"))
+        for fmt, checkbox in self.format_checkboxes.items():
+            checkbox.configure(text=self.t(f"checkbox_format_{fmt}"))
 
         self.adv_intro_title_label.configure(text=self.t("adv_intro_title"))
         self.adv_intro_body_label.configure(text=self.t("adv_intro_body"))
@@ -443,18 +443,27 @@ class WhisperGUI(ctk.CTk):
         self.device_label.configure(text=self.t("label_device"))
         self.precision_label.configure(text=self.t("label_precision"))
         self.batch_size_label.configure(text=self.t("label_batch_size"))
+        self.mode_label_widget.configure(text=self.t("label_mode"))
+        self.combo_mode.configure(values=self.localized_mode_values())
+        self.set_mode_selection(current_mode)
+
+        self.vad_section_label.configure(text=self.t("section_vad"))
+        self.check_vad.configure(text=self.t("checkbox_enable_vad"))
         self.use_vad_label.configure(text=self.t("label_use_vad"))
-        self.segmentation_section_label.configure(text=self.t("section_segmentation"))
         self.vad_threshold_label.configure(text=self.t("label_vad_threshold"))
-        self.decode_profile_label_widget.configure(text=self.t("label_decode_profile"))
-        self.combo_decode.configure(values=self.localized_decode_profile_values())
-        self.set_decode_profile_selection(current_decode)
-        self.target_db_label.configure(text=self.t("label_target_db"))
-        self.merge_gap_label.configure(text=self.t("label_merge_gap"))
+        self.min_speech_label.configure(text=self.t("label_min_speech"))
         self.min_silence_label.configure(text=self.t("label_min_silence"))
-        self.chunk_sec_label.configure(text=self.t("label_chunk_sec"))
-        self.overlap_sec_label.configure(text=self.t("label_overlap_sec"))
-        self.max_new_tokens_label.configure(text=self.t("label_max_new_tokens"))
+        self.speech_pad_label.configure(text=self.t("label_speech_pad"))
+
+        self.decoding_section_label.configure(text=self.t("section_decoding"))
+        self.beam_size_label.configure(text=self.t("label_beam_size"))
+        self.check_temp_fallback.configure(text=self.t("checkbox_temp_fallback"))
+        self.check_condition_prev.configure(text=self.t("checkbox_condition_prev"))
+        self.check_word_timestamps.configure(text=self.t("checkbox_word_timestamps"))
+        self.no_speech_label.configure(text=self.t("label_no_speech"))
+        self.compression_ratio_label.configure(text=self.t("label_compression_ratio"))
+        self.log_prob_label.configure(text=self.t("label_log_prob"))
+        self.hallucination_label.configure(text=self.t("label_hallucination"))
 
         self.logs_intro_title_label.configure(text=self.t("logs_intro_title"))
         self.logs_intro_body_label.configure(text=self.t("logs_intro_body"))
@@ -462,7 +471,6 @@ class WhisperGUI(ctk.CTk):
         for label, key in self.localized_help_labels:
             label.configure(text=self.t(key))
 
-        self.refresh_vad_status_text()
         self.refresh_local_models()
         self.status_label.configure(text=self.translate_status(self.current_status_raw))
 
@@ -476,29 +484,27 @@ class WhisperGUI(ctk.CTk):
             return self.t("status_error")
         if "Stopped" in clean_status:
             return self.t("status_stopped")
-        if clean_status.startswith("Processing "):
-            return f"{self.t('status_processing_file_prefix')}{clean_status[len('Processing '):]}"
-        if clean_status.startswith("Pipeline: "):
-            return f"{self.t('status_processing_file_prefix')}{clean_status[len('Pipeline: '):]}"
-        if clean_status.startswith("transcribing:"):
-            # Neutral status code emitted by whisper_core. Format: "transcribing:<pct>"
-            return self.t("status_processing_percent", percent=clean_status.split(":", 1)[1].strip())
-        # Legacy: older cores emitted the Russian hardcoded string directly.
-        if clean_status.startswith("Обработка:"):
-            return self.t("status_processing_percent", percent=clean_status.split(":", 1)[1].strip())
+        parsed = parse_status(status)
+        if parsed.kind == "processing":
+            return f"{self.t('status_processing_file_prefix')}{parsed.name}"
+        if parsed.kind == "percent":
+            return self.t("status_processing_percent", percent=parsed.percent)
+        if parsed.kind == "stage":
+            # Long files spend up to a minute decoding and running VAD before the
+            # first segment arrives; without this the UI looks frozen.
+            key = f"status_stage_{parsed.stage}"
+            if key in UI_TEXT[self.ui_language]:
+                return self.t(key)
+            return clean_status
         return clean_status
 
     def check_hardware(self):
-        self.has_cuda = torch.cuda.is_available()
-        self.has_local_vad = self.core.resolve_local_vad_repo() is not None
+        self.has_cuda = has_cuda()
         if not self.has_cuda:
             messagebox.showwarning(
                 self.t("hardware_check_title"),
                 self.t("hardware_check_body"),
             )
-        if not self.has_local_vad:
-            self.check_vad.deselect()
-        self.refresh_vad_status_text()
         self.refresh_runtime_summary()
 
     def short_model_name(self, model_value: str) -> str:
@@ -510,6 +516,10 @@ class WhisperGUI(ctk.CTk):
         lower = model_value.lower()
         if Path(model_value).exists():
             return self.t("model_desc_custom")
+        # Checked before "large" because the name contains it, and the two behave
+        # very differently: turbo is distilled and trades punctuation for speed.
+        if "turbo" in lower:
+            return self.t("model_desc_turbo")
         if "medium" in lower:
             return self.t("model_desc_medium")
         if "small" in lower:
@@ -520,16 +530,17 @@ class WhisperGUI(ctk.CTk):
 
     def refresh_runtime_summary(self):
         preset = self.selected_preset_key()
-        model_value = self.combo_model.get().strip() if hasattr(self, "combo_model") else "openai/whisper-medium"
+        model_value = self.combo_model.get().strip() if hasattr(self, "combo_model") else C.DEFAULT_MODEL
 
         self.preset_summary_label.configure(text=self.preset_description(preset))
 
         compute_value = self.combo_device.get() if hasattr(self, "combo_device") else ("cuda" if self.has_cuda else "cpu")
+        mode_key = self.selected_mode_key()
         runtime_lines = [
             self.t("runtime_model_line", model=self.short_model_name(model_value)),
             self.t("runtime_compute_line", compute=compute_value.upper()),
-            self.t("runtime_mode_line"),
-            self.t("runtime_vad_found_line" if self.has_local_vad else "runtime_vad_missing_line"),
+            self.t("runtime_mode_line", mode=self.mode_label(mode_key)),
+            self.t("runtime_formats_line", formats=", ".join(self.selected_formats()) or "—"),
         ]
         self.runtime_summary_label.configure(text="\n".join(runtime_lines))
 
@@ -538,19 +549,11 @@ class WhisperGUI(ctk.CTk):
 
     def set_entry_value(self, entry: ctk.CTkEntry, value):
         entry.delete(0, "end")
-        entry.insert(0, str(value))
+        entry.insert(0, "" if value is None else str(value))
 
-    def discover_local_models(self) -> List[str]:
-        models_root = Path(__file__).parent / C.LOCAL_MODELS_SUBDIR
-        if not models_root.exists():
-            return []
-
-        choices = []
-        for cache_dir in sorted(models_root.glob("models--*")):
-            snapshots_dir = cache_dir / "snapshots"
-            if snapshots_dir.exists() and any(path.is_dir() for path in snapshots_dir.iterdir()):
-                choices.append(cache_dir.name[len("models--"):].replace("--", "/"))
-        return choices
+    def discover_local_models(self) -> list[str]:
+        """Converted CTranslate2 models under models/ct2/."""
+        return discover_ct2_models()
 
     def refresh_local_models(self):
         choices = self.discover_local_models()
@@ -599,32 +602,46 @@ class WhisperGUI(ctk.CTk):
             return  # unknown preset key — leave fields untouched
         use_cuda = self.has_cuda
 
-        # Device + precision: presets prefer CUDA when available; "auto" dtype
-        # lets WhisperCore pick bf16 on Ampere+ (cc>=8), fp16 on older CUDA,
-        # and fp32 on CPU — bf16 is more numerically stable for Whisper.
+        # "auto" compute type lets CTranslate2 pick float16 on CUDA and int8 on
+        # CPU, which are the fastest accurate choices on each.
         self.combo_device.set("cuda" if use_cuda else "cpu")
-        self.combo_dtype.set("auto" if use_cuda else "float32")
+        self.combo_compute.set("auto")
 
-        # Numeric fields driven entirely by the preset table.
-        batch = preset["batch_size_cuda"] if use_cuda else preset["batch_size_cpu"]
-        self.set_entry_value(self.entry_batch, batch)
-        self.set_decode_profile_selection(preset["decode_profile"])
-        self.set_entry_value(self.entry_target_db, preset["target_db"])
-        self.set_entry_value(self.entry_vad_merge_gap, preset["vad_merge_gap"])
-        self.set_entry_value(self.entry_vad_silence, preset["vad_silence_ms"])
-        self.set_entry_value(self.entry_chunk_sec, preset["chunk_sec"])
-        self.set_entry_value(self.entry_overlap_sec, preset["overlap_sec"])
-        self.set_entry_value(self.entry_max_tokens, preset["max_new_tokens"])
+        self.set_mode_selection("batched" if preset["batched"] else "sequential")
+        self.set_entry_value(
+            self.entry_batch,
+            preset["batch_size_cuda"] if use_cuda else preset["batch_size_cpu"],
+        )
+        self.set_entry_value(self.entry_beam_size, preset["beam_size"])
+        self.set_entry_value(self.entry_vad_min_speech, preset["vad_min_speech_ms"])
+        self.set_entry_value(self.entry_vad_silence, preset["vad_min_silence_ms"])
+        self.set_entry_value(self.entry_vad_pad, preset["vad_speech_pad_ms"])
+        self.set_entry_value(self.entry_no_speech, preset["no_speech_threshold"])
+        self.set_entry_value(self.entry_compression_ratio, preset["compression_ratio_threshold"])
+        self.set_entry_value(self.entry_log_prob, preset["log_prob_threshold"])
+        # Blank means "off" — the field is optional, unlike the others.
+        self.set_entry_value(self.entry_hallucination,
+                             preset["hallucination_silence_threshold"] or "")
 
-        # VAD checkbox respects local availability; threshold is preset-driven.
-        if preset["vad_enabled"] and self.has_local_vad:
-            self.check_vad.select()
-        else:
-            self.check_vad.deselect()
+        self._set_check(self.check_temp_fallback, preset["temperature_fallback"])
+        self._set_check(self.check_condition_prev, preset["condition_on_previous_text"])
+        self._set_check(self.check_word_timestamps, preset["word_timestamps"])
+        self._set_check(self.check_vad, preset["vad_enabled"])
+
         self.slider_vad.set(preset["vad_threshold"])
         self.update_vad_label(preset["vad_threshold"])
 
         self.refresh_runtime_summary()
+
+    @staticmethod
+    def _set_check(checkbox, enabled: bool) -> None:
+        checkbox.select() if enabled else checkbox.deselect()
+
+    def selected_formats(self) -> list[str]:
+        """Output formats currently ticked, in the canonical constants order."""
+        if not hasattr(self, "format_checkboxes"):
+            return list(C.DEFAULT_OUTPUT_FORMATS)
+        return [fmt for fmt in C.OUTPUT_FORMATS if self.format_checkboxes[fmt].get()]
 
     def update_vad_label(self, val):
         self.lbl_vad_val.configure(text=f"{float(val):.2f}")
@@ -714,13 +731,17 @@ class WhisperGUI(ctk.CTk):
             "combo_model", "btn_refresh_models", "btn_model_folder",
             "combo_lang", "check_auto_lang",
             "combo_preset", "combo_ui_lang",
-            "combo_device", "combo_dtype",
-            "entry_batch", "check_vad", "slider_vad", "combo_decode",
-            "entry_target_db", "entry_vad_merge_gap", "entry_vad_silence",
-            "entry_chunk_sec", "entry_overlap_sec", "entry_max_tokens",
-            "check_srt",
+            "entry_initial_prompt",
+            "combo_device", "combo_compute", "combo_mode", "entry_batch",
+            "check_vad", "slider_vad", "entry_vad_min_speech", "entry_vad_silence",
+            "entry_vad_pad",
+            "entry_beam_size", "check_temp_fallback", "check_condition_prev",
+            "check_word_timestamps", "entry_no_speech", "entry_compression_ratio",
+            "entry_log_prob", "entry_hallucination",
         ]
-        self._input_widgets = [getattr(self, n) for n in names if hasattr(self, n)]
+        widgets = [getattr(self, n) for n in names if hasattr(self, n)]
+        widgets.extend(getattr(self, "format_checkboxes", {}).values())
+        self._input_widgets = widgets
 
     def _set_inputs_state(self, enabled: bool) -> None:
         """Enable/disable every collected input. Defensive: per-widget try."""
@@ -742,21 +763,24 @@ class WhisperGUI(ctk.CTk):
             view_state = state if (enabled and self.last_result_path) else "disabled"
             self.btn_view_result.configure(state=view_state)
 
-    def _track_finished_file(self, audio_name: str) -> None:
-        """Compute the .txt path the core just wrote and remember it.
+    def on_core_result(self, audio_path: Path, written: list[Path]) -> None:
+        """Called from the worker thread with the files the core actually wrote."""
+        self.result_queue.put((audio_path, list(written)))
 
-        whisper_core writes <stem>.txt to cfg.output_dir; we mirror that.
+    def _track_finished_file(self, written: list[Path]) -> None:
+        """Remember what to open for 'View result' / 'Open folder'.
+
+        Driven by the real paths the core reports rather than by guessing
+        `<stem>.txt`, which is wrong as soon as the user picks, say, Markdown
+        and JSON but not plain text.
         """
-        try:
-            output_dir = Path(self.entry_output.get().strip())
-        except Exception:
+        existing = [p for p in written if p.exists()]
+        if not existing:
             return
-        if not output_dir or str(output_dir) == ".":
-            return
-        self.last_output_dir = output_dir
-        candidate = output_dir / f"{Path(audio_name).stem}.txt"
-        if candidate.exists():
-            self.last_result_path = candidate
+        self.last_output_dir = existing[0].parent
+        preferred = pick_preview(existing)
+        if preferred is not None:
+            self.last_result_path = preferred
 
     def open_results_folder(self) -> None:
         """Open the configured output folder in the OS file manager."""
@@ -837,24 +861,13 @@ class WhisperGUI(ctk.CTk):
         file boundary so the resulting text can include 'File N/M: name'
         plus an ETA estimate.
         """
-        stripped = status.strip()
-
-        # File-boundary statuses come from whisper_core: 'Processing X...',
-        # 'Pipeline: X', 'Done: X'. Update the tracker before formatting.
-        if stripped.startswith("Processing ") and stripped.endswith("..."):
-            name = stripped[len("Processing "):-3]
-            self._note_file_started(name)
-        elif stripped.startswith("Pipeline: "):
-            name = stripped[len("Pipeline: "):]
-            # Only count once per file: Pipeline often comes right after
-            # the matching Processing, so don't double-increment.
-            if name != self.current_file_name:
-                self._note_file_started(name)
-        elif stripped.startswith("Done: "):
+        # File-boundary statuses are parsed rather than string-matched here; the
+        # wire format has a single owner in whisper_engine.progress.
+        parsed = parse_status(status)
+        if parsed.kind == "processing":
+            self._note_file_started(parsed.name)
+        elif parsed.kind == "done_file":
             self._note_file_done()
-            # Phase F: remember the .txt the core just produced so the
-            # post-run "View result" button has something to open.
-            self._track_finished_file(stripped[len("Done: "):])
 
         # Translate the base status using the existing translator.
         base = self.translate_status(status)
@@ -928,6 +941,17 @@ class WhisperGUI(ctk.CTk):
         except (ValueError, TypeError):
             return default
 
+    @staticmethod
+    def _optional_float(value):
+        """Parse an optional numeric field. Blank means "off", i.e. None."""
+        text = str(value).strip()
+        if not text:
+            return None
+        try:
+            return float(text)
+        except (ValueError, TypeError):
+            return None
+
     def _apply_persisted_entry(self, entry, value):
         """Write `value` into a CTkEntry only if it looks meaningful.
 
@@ -964,10 +988,14 @@ class WhisperGUI(ctk.CTk):
 
         # Preset (re-apply so its baseline matches what the user last chose;
         # later we override individual fields the user tweaked manually).
+        # Always reflect the saved preset in the combo, even when it matches the
+        # default — otherwise the sidebar shows one preset while the settings
+        # file holds another.
         preset_key = s.get("preset")
-        if preset_key in self.preset_keys and preset_key != "fast":
+        if preset_key in self.preset_keys:
             self.set_preset_selection(preset_key)
-            self.apply_preset(preset_key)
+            if preset_key != C.DEFAULT_PRESET:
+                self.apply_preset(preset_key)
 
         # Files
         audio_dir = s.get("audio_dir")
@@ -980,22 +1008,23 @@ class WhisperGUI(ctk.CTk):
             self.entry_output.insert(0, output_dir)
 
         # Model — make sure custom paths still appear in the combo's list.
-        model_path = s.get("model_path")
-        if isinstance(model_path, str) and model_path:
+        model_id = s.get("model_id")
+        if isinstance(model_id, str) and model_id:
             current_values = list(self.combo_model.cget("values") or [])
-            if model_path not in current_values:
-                current_values.append(model_path)
-                self.combo_model.configure(values=current_values)
-            self.combo_model.set(model_path)
+            # A model that no longer exists on disk must not be silently selected;
+            # only offer it if it is a converted directory or an explicit path.
+            if model_id in current_values or Path(model_id).is_dir():
+                if model_id not in current_values:
+                    current_values.append(model_id)
+                    self.combo_model.configure(values=current_values)
+                self.combo_model.set(model_id)
 
         # Transcription language + auto-detect
         trans_lang = s.get("transcription_language")
         if trans_lang in C.TRANSCRIPTION_LANGUAGES:
             self.combo_lang.set(trans_lang)
-        if s.get("auto_lang"):
-            self.check_auto_lang.select()
-        elif "auto_lang" in s:
-            self.check_auto_lang.deselect()
+        self._set_check(self.check_auto_lang, bool(s.get("auto_lang")))
+        self._apply_persisted_entry(self.entry_initial_prompt, s.get("initial_prompt"))
 
         # Compute (clamp cuda→cpu when no GPU is present)
         device = s.get("device")
@@ -1003,41 +1032,45 @@ class WhisperGUI(ctk.CTk):
             if device == "cuda" and not self.has_cuda:
                 device = "cpu"
             self.combo_device.set(device)
-        dtype = s.get("dtype")
-        if dtype in C.DTYPES:
-            self.combo_dtype.set(dtype)
+        compute_type = s.get("compute_type")
+        if compute_type in C.COMPUTE_TYPES:
+            self.combo_compute.set(compute_type)
+        if "batched" in s:
+            self.set_mode_selection("batched" if s.get("batched") else "sequential")
 
         # Numeric overrides on top of the preset baseline
         self._apply_persisted_entry(self.entry_batch, s.get("batch_size"))
-        self._apply_persisted_entry(self.entry_max_tokens, s.get("max_new_tokens"))
-        self._apply_persisted_entry(self.entry_chunk_sec, s.get("chunk_sec"))
-        self._apply_persisted_entry(self.entry_overlap_sec, s.get("overlap_sec"))
-        self._apply_persisted_entry(self.entry_target_db, s.get("target_db"))
-        self._apply_persisted_entry(self.entry_vad_silence, s.get("vad_silence_ms"))
-        self._apply_persisted_entry(self.entry_vad_merge_gap, s.get("vad_merge_gap"))
+        self._apply_persisted_entry(self.entry_beam_size, s.get("beam_size"))
+        self._apply_persisted_entry(self.entry_vad_min_speech, s.get("vad_min_speech_ms"))
+        self._apply_persisted_entry(self.entry_vad_silence, s.get("vad_min_silence_ms"))
+        self._apply_persisted_entry(self.entry_vad_pad, s.get("vad_speech_pad_ms"))
+        self._apply_persisted_entry(self.entry_no_speech, s.get("no_speech_threshold"))
+        self._apply_persisted_entry(self.entry_compression_ratio,
+                                    s.get("compression_ratio_threshold"))
+        self._apply_persisted_entry(self.entry_log_prob, s.get("log_prob_threshold"))
+        # Optional field: an explicit null means "off", so clear rather than skip.
+        if "hallucination_silence_threshold" in s:
+            self.set_entry_value(self.entry_hallucination,
+                                 s.get("hallucination_silence_threshold") or "")
 
-        # Decode profile
-        decode = s.get("decode_profile")
-        if decode in self.decode_profile_keys:
-            self.set_decode_profile_selection(decode)
+        for key, checkbox in (
+            ("temperature_fallback", self.check_temp_fallback),
+            ("condition_on_previous_text", self.check_condition_prev),
+            ("word_timestamps", self.check_word_timestamps),
+            ("vad_filter", self.check_vad),
+        ):
+            if key in s:
+                self._set_check(checkbox, bool(s.get(key)))
 
-        # VAD checkbox + threshold (respect local availability for the box)
-        if "use_vad" in s:
-            if s.get("use_vad") and self.has_local_vad:
-                self.check_vad.select()
-            else:
-                self.check_vad.deselect()
         vad_threshold = s.get("vad_threshold")
-        if isinstance(vad_threshold, (int, float)):
+        if isinstance(vad_threshold, int | float):
             self.slider_vad.set(float(vad_threshold))
             self.update_vad_label(float(vad_threshold))
 
-        # SRT toggle
-        if "save_srt" in s:
-            if s.get("save_srt"):
-                self.check_srt.select()
-            else:
-                self.check_srt.deselect()
+        formats = s.get("formats")
+        if isinstance(formats, list) and any(f in C.OUTPUT_FORMATS for f in formats):
+            for fmt, checkbox in self.format_checkboxes.items():
+                self._set_check(checkbox, fmt in formats)
 
         # Reflect any device/model/lang change in the runtime summary text.
         self.refresh_runtime_summary()
@@ -1058,20 +1091,26 @@ class WhisperGUI(ctk.CTk):
             "preset": self.selected_preset_key(),
             "audio_dir": self.entry_audio.get().strip() if hasattr(self, "entry_audio") else "",
             "output_dir": self.entry_output.get().strip() if hasattr(self, "entry_output") else "",
-            "model_path": self.combo_model.get().strip() if hasattr(self, "combo_model") else defaults["model_path"],
+            "initial_prompt": self.entry_initial_prompt.get().strip() if hasattr(self, "entry_initial_prompt") else "",
+            "model_id": self.combo_model.get().strip() if hasattr(self, "combo_model") else defaults["model_id"],
             "device": self.combo_device.get() if hasattr(self, "combo_device") else defaults["device"],
-            "dtype": self.combo_dtype.get() if hasattr(self, "combo_dtype") else defaults["dtype"],
+            "compute_type": self.combo_compute.get() if hasattr(self, "combo_compute") else defaults["compute_type"],
+            "batched": self.selected_mode_key() == "batched",
             "batch_size": self._safe_int(self.entry_batch.get(), defaults["batch_size"]) if hasattr(self, "entry_batch") else defaults["batch_size"],
-            "decode_profile": self.selected_decode_profile_key() if hasattr(self, "combo_decode") else defaults["decode_profile"],
-            "max_new_tokens": self._safe_int(self.entry_max_tokens.get(), defaults["max_new_tokens"]) if hasattr(self, "entry_max_tokens") else defaults["max_new_tokens"],
-            "chunk_sec": self._safe_float(self.entry_chunk_sec.get(), defaults["chunk_sec"]) if hasattr(self, "entry_chunk_sec") else defaults["chunk_sec"],
-            "overlap_sec": self._safe_float(self.entry_overlap_sec.get(), defaults["overlap_sec"]) if hasattr(self, "entry_overlap_sec") else defaults["overlap_sec"],
-            "target_db": self._safe_float(self.entry_target_db.get(), defaults["target_db"]) if hasattr(self, "entry_target_db") else defaults["target_db"],
-            "use_vad": bool(self.check_vad.get()) if hasattr(self, "check_vad") else defaults["use_vad"],
+            "beam_size": self._safe_int(self.entry_beam_size.get(), defaults["beam_size"]) if hasattr(self, "entry_beam_size") else defaults["beam_size"],
+            "temperature_fallback": bool(self.check_temp_fallback.get()) if hasattr(self, "check_temp_fallback") else defaults["temperature_fallback"],
+            "condition_on_previous_text": bool(self.check_condition_prev.get()) if hasattr(self, "check_condition_prev") else defaults["condition_on_previous_text"],
+            "word_timestamps": bool(self.check_word_timestamps.get()) if hasattr(self, "check_word_timestamps") else defaults["word_timestamps"],
+            "no_speech_threshold": self._safe_float(self.entry_no_speech.get(), defaults["no_speech_threshold"]) if hasattr(self, "entry_no_speech") else defaults["no_speech_threshold"],
+            "compression_ratio_threshold": self._safe_float(self.entry_compression_ratio.get(), defaults["compression_ratio_threshold"]) if hasattr(self, "entry_compression_ratio") else defaults["compression_ratio_threshold"],
+            "log_prob_threshold": self._safe_float(self.entry_log_prob.get(), defaults["log_prob_threshold"]) if hasattr(self, "entry_log_prob") else defaults["log_prob_threshold"],
+            "hallucination_silence_threshold": self._optional_float(self.entry_hallucination.get()) if hasattr(self, "entry_hallucination") else None,
+            "vad_filter": bool(self.check_vad.get()) if hasattr(self, "check_vad") else defaults["vad_filter"],
             "vad_threshold": float(self.slider_vad.get()) if hasattr(self, "slider_vad") else defaults["vad_threshold"],
-            "vad_silence_ms": self._safe_int(self.entry_vad_silence.get(), defaults["vad_silence_ms"]) if hasattr(self, "entry_vad_silence") else defaults["vad_silence_ms"],
-            "vad_merge_gap": self._safe_float(self.entry_vad_merge_gap.get(), defaults["vad_merge_gap"]) if hasattr(self, "entry_vad_merge_gap") else defaults["vad_merge_gap"],
-            "save_srt": bool(self.check_srt.get()) if hasattr(self, "check_srt") else False,
+            "vad_min_speech_ms": self._safe_int(self.entry_vad_min_speech.get(), defaults["vad_min_speech_ms"]) if hasattr(self, "entry_vad_min_speech") else defaults["vad_min_speech_ms"],
+            "vad_min_silence_ms": self._safe_int(self.entry_vad_silence.get(), defaults["vad_min_silence_ms"]) if hasattr(self, "entry_vad_silence") else defaults["vad_min_silence_ms"],
+            "vad_speech_pad_ms": self._safe_int(self.entry_vad_pad.get(), defaults["vad_speech_pad_ms"]) if hasattr(self, "entry_vad_pad") else defaults["vad_speech_pad_ms"],
+            "formats": self.selected_formats() or list(C.DEFAULT_OUTPUT_FORMATS),
         }
 
     def on_close(self):
@@ -1121,6 +1160,12 @@ class WhisperGUI(ctk.CTk):
             self.txt_log.insert("end", msg + "\n")
             self.txt_log.see("end")
             self.txt_log.configure(state="disabled")
+
+        # Drained before the progress queue: a terminal status enables the
+        # post-run buttons, which need last_result_path to already be set.
+        while not self.result_queue.empty():
+            _audio_path, written = self.result_queue.get()
+            self._track_finished_file(written)
 
         while not self.progress_queue.empty():
             percent, status = self.progress_queue.get()
@@ -1177,30 +1222,47 @@ class WhisperGUI(ctk.CTk):
         # The whole config-build + file-scan block is wrapped so any
         # unexpected exception (bad output_dir path characters, read-only
         # folder, etc.) lands on the banner instead of dying silently.
+        formats = self.selected_formats()
+        if not formats:
+            self.error_banner.show(self.t("banner_no_formats"), level="error")
+            return
+
         try:
             cfg = TranscriptionConfig(
-                model_path=self.combo_model.get().strip(),
+                model_id=self.combo_model.get().strip(),
                 lang=self.combo_lang.get(),
                 auto_lang=bool(self.check_auto_lang.get()),
-                chunk_sec=float(self.entry_chunk_sec.get()),
-                overlap_sec=float(self.entry_overlap_sec.get()),
+                initial_prompt=self.entry_initial_prompt.get().strip() or None,
                 device=self.combo_device.get(),
-                dtype=self.combo_dtype.get(),
+                compute_type=self.combo_compute.get(),
+                batched=self.selected_mode_key() == "batched",
                 batch_size=int(self.entry_batch.get()),
-                max_new_tokens=int(self.entry_max_tokens.get()),
-                decode_profile=self.selected_decode_profile_key(),
-                target_db=float(self.entry_target_db.get()),
-                use_vad=bool(self.check_vad.get()),
+                beam_size=int(self.entry_beam_size.get()),
+                temperature_fallback=bool(self.check_temp_fallback.get()),
+                condition_on_previous_text=bool(self.check_condition_prev.get()),
+                word_timestamps=bool(self.check_word_timestamps.get()),
+                no_speech_threshold=float(self.entry_no_speech.get()),
+                compression_ratio_threshold=float(self.entry_compression_ratio.get()),
+                log_prob_threshold=float(self.entry_log_prob.get()),
+                hallucination_silence_threshold=self._optional_float(
+                    self.entry_hallucination.get()),
+                vad_filter=bool(self.check_vad.get()),
                 vad_threshold=float(self.slider_vad.get()),
+                vad_min_speech_ms=int(self.entry_vad_min_speech.get()),
                 vad_min_silence_ms=int(self.entry_vad_silence.get()),
-                vad_merge_gap_sec=float(self.entry_vad_merge_gap.get()),
-                save_srt=bool(self.check_srt.get()),
+                vad_speech_pad_ms=int(self.entry_vad_pad.get()),
+                formats=tuple(formats),
                 output_dir=Path(self.entry_output.get().strip()),
             )
         except (ValueError, OSError) as e:
             self.log(self.t("log_config_error", error=e))
             self.error_banner.show(self.t("banner_start_failed", error=e), level="error")
             return
+
+        # Surface anything the config had to override, so the Advanced tab never
+        # claims a setting that faster-whisper will discard.
+        if cfg.notes:
+            self.error_banner.show("\n".join(cfg.notes), level="warn")
 
         audio_dir = Path(self.entry_audio.get().strip())
         if not audio_dir.exists():
@@ -1211,9 +1273,7 @@ class WhisperGUI(ctk.CTk):
             )
             return
 
-        self.files_to_process = []
-        for ext in C.AUDIO_EXTENSIONS:
-            self.files_to_process.extend(audio_dir.glob(ext))
+        self.files_to_process = find_audio_files(audio_dir)
 
         if not self.files_to_process:
             self.log(self.t("log_no_audio_files"))
@@ -1222,7 +1282,6 @@ class WhisperGUI(ctk.CTk):
             )
             return
 
-        self.files_to_process = sorted(self.files_to_process)
         self.log(self.t("log_found_files", count=len(self.files_to_process)))
 
         # Arm per-file progress tracking before the worker thread starts

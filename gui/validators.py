@@ -1,28 +1,23 @@
-# -*- coding: utf-8 -*-
 """Input validation for numeric Entry widgets.
 
-Two parts:
-  * `IntRangeValidator` / `FloatRangeValidator` / `PathValidator` —
-    pure callables that take the entry's current string and return
-    a translation key + format kwargs on error, or None when OK.
-  * `ValidatedEntry` — a CTkEntry subclass that runs the validator on
-    every change (keyboard or programmatic), turns its border red on
-    failure, and exposes `is_valid()` / `get_error()` for the
-    pre-start-of-processing check.
+`IntRangeValidator` / `FloatRangeValidator` / `PathValidator` are pure callables
+that take the entry's current string and return a translation key + format kwargs
+on error, or None when OK.
 
 Validators return a tuple `(i18n_key, kwargs)` rather than a final
 string so the GUI can render them in the user's chosen UI language.
+
+Deliberately free of any customtkinter import: the widget that consumes these
+lives in `gui.widgets.validated_entry`. That split is what lets the test suite
+import this module on a headless runner with no Tk installed.
 """
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional, Tuple, Dict, Any
-
-import customtkinter as ctk
-
+from typing import Any
 
 # Type alias: an error is either None (valid) or (i18n_key, format_kwargs).
-ValidationError = Optional[Tuple[str, Dict[str, Any]]]
+ValidationError = tuple[str, dict[str, Any]] | None
 
 
 class IntRangeValidator:
@@ -75,67 +70,3 @@ class PathValidator:
         if self.must_exist and not Path(text).exists():
             return ("validation_path_missing", {"path": text})
         return None
-
-
-# ----------------------------------------------------------------------
-# Validated entry widget
-# ----------------------------------------------------------------------
-# Border color used to flag invalid input. Picked from the palette so it
-# matches the existing Stop-button red and stays consistent in dark mode.
-_INVALID_BORDER_COLOR = "#D63D3D"
-
-
-class ValidatedEntry(ctk.CTkEntry):
-    """CTkEntry that revalidates on every change and shows a red border on error.
-
-    `label_key` is the i18n key of the field's label (e.g. `label_batch_size`).
-    The pre-flight check in start_process uses it to build human-readable
-    error messages like "Batch size: must be integer in [1, 32]".
-    """
-
-    def __init__(self, master, validator, *, label_key: str = "", **kwargs):
-        super().__init__(master, **kwargs)
-        self.validator = validator
-        self.label_key = label_key
-        # Capture whatever border color the theme assigned at construction
-        # time so we can restore it after the user fixes the input.
-        self._default_border = self.cget("border_color")
-        self._invalid_border = _INVALID_BORDER_COLOR
-        self._last_error: ValidationError = None
-        # Keyboard typing fires <KeyRelease>; FocusOut is a safety net for
-        # paste-and-tab-out flows that some IMEs swallow.
-        self.bind("<KeyRelease>", self._revalidate_event)
-        self.bind("<FocusOut>", self._revalidate_event)
-
-    # CTkEntry.delete and .insert are how `set_entry_value` (used by
-    # apply_preset) and the persistence loader mutate the field. Override
-    # them so programmatic changes also fire validation — otherwise a
-    # corrupt saved settings file would leave a stale red border or
-    # (worse) a stale "valid" status.
-    def insert(self, index, value):
-        super().insert(index, value)
-        self._revalidate()
-
-    def delete(self, first_index, last_index=None):
-        super().delete(first_index, last_index)
-        self._revalidate()
-
-    # ---- validation core ---------------------------------------------
-    def _revalidate_event(self, _event=None):
-        self._revalidate()
-
-    def _revalidate(self) -> None:
-        self._last_error = self.validator(self.get())
-        if self._last_error is None:
-            self.configure(border_color=self._default_border)
-        else:
-            self.configure(border_color=self._invalid_border)
-
-    def is_valid(self) -> bool:
-        """Run a fresh validation pass and return True iff the value is OK."""
-        self._revalidate()
-        return self._last_error is None
-
-    def get_error(self) -> ValidationError:
-        """Return the last `(i18n_key, kwargs)` error or None."""
-        return self._last_error

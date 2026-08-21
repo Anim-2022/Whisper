@@ -1,0 +1,36 @@
+# Tooling configuration only.
+#
+# There is deliberately no [project] table: the application is run from a checkout
+# via Start_Whisper.bat, not installed as a package, and declaring dependencies
+# here as well as in the requirements-*.txt files would guarantee drift.
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# GPU tests need converted weights and a CUDA device; GUI tests need a real Tk
+# display. Both are opt-in, so the default suite runs on a headless CI runner:
+#   pytest -m gpu
+#   pytest -m gui
+addopts = "-q -m 'not gpu and not gui'"
+markers = [
+    "gpu: requires CUDA and converted model weights (excluded by default)",
+    "gui: requires a Tk display (excluded by default)",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = [".venv", ".venv-fw", "models", "audio", "audio_to_text", "predictions"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = [
+    "E501",  # long lines are caught by the formatter, not worth failing CI over
+    "B008",  # function call in default argument - not a pattern used here
+]
+
+[tool.coverage.run]
+source = ["whisper_engine", "gui"]
+omit = ["*/widgets/*", "*/__init__.py"]
+
+[tool.coverage.report]
+exclude_lines = ["pragma: no cover", "if TYPE_CHECKING:", "raise NotImplementedError"]

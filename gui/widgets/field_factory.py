@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Small builders that eliminate label+entry+help-text boilerplate.
 
 Each helper takes `app` (WhisperGUI) so it can:
@@ -13,12 +12,43 @@ pre-refactor code.
 """
 from __future__ import annotations
 
-from typing import Callable, Optional, Sequence
+from collections.abc import Callable, Sequence
 
 import customtkinter as ctk
 
 from .. import constants as C
-from ..validators import ValidatedEntry
+from .validated_entry import ValidatedEntry
+
+
+class RowCounter:
+    """Hands out consecutive grid rows so sections cannot overlap.
+
+    Hardcoded row numbers are fragile in a way that fails silently: the helpers
+    below place their help line on ``row + 1``, so inserting one field into a
+    section pushes its last help line onto the next section's header and the two
+    labels are drawn on top of each other. That is exactly how the VAD padding
+    hint came to overlap the "Decoding" heading.
+
+    Callers ask for as many rows as the widget actually occupies::
+
+        make_labeled_entry(parent, app, rows.take(2), ...)   # field + help line
+        make_section_header(parent, app, rows.take(), ...)   # one row
+    """
+
+    def __init__(self, start: int = 0):
+        self._next = start
+
+    def take(self, count: int = 1) -> int:
+        """Reserve `count` rows and return the first of them."""
+        if count < 1:
+            raise ValueError("count must be >= 1")
+        first = self._next
+        self._next += count
+        return first
+
+    @property
+    def next_row(self) -> int:
+        return self._next
 
 
 def make_help_label(parent, app, row: int, text_key: str,
@@ -58,8 +88,8 @@ def make_field_label(parent, app, row: int, text_key: str):
 
 
 def make_labeled_entry(parent, app, row: int, label_key: str,
-                       help_key: Optional[str], *, default=None,
-                       validator: Optional[Callable] = None):
+                       help_key: str | None, *, default=None,
+                       validator: Callable | None = None):
     """Label (col 0) + Entry (col 1), help line on `row + 1`.
 
     When `validator` is provided the widget is a `ValidatedEntry` that
@@ -89,9 +119,9 @@ def make_labeled_entry(parent, app, row: int, label_key: str,
 
 
 def make_labeled_combo(parent, app, row: int, label_key: str,
-                       help_key: Optional[str], values: Sequence[str],
-                       default: Optional[str] = None,
-                       *, command: Optional[Callable] = None,
+                       help_key: str | None, values: Sequence[str],
+                       default: str | None = None,
+                       *, command: Callable | None = None,
                        sticky: str = "ew"):
     """Label + ComboBox, help line on `row + 1`. Returns (label, combo)."""
     label = make_field_label(parent, app, row, label_key)
@@ -105,9 +135,9 @@ def make_labeled_combo(parent, app, row: int, label_key: str,
 
 
 def make_labeled_browse_row(parent, app, row: int, label_key: str,
-                            help_key: Optional[str], on_browse: Callable,
+                            help_key: str | None, on_browse: Callable,
                             *, default: str = "",
-                            placeholder_key: Optional[str] = None):
+                            placeholder_key: str | None = None):
     """Label + Entry + 'Browse' button on one row, help line on next.
 
     Returns (label, entry, browse_button).

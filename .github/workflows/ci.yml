@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "feat/**", "fix/**"]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: true
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      # v4/v5 target Node.js 20, which the runners now force onto Node 24 with a
+      # deprecation warning on every run.
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      # requirements-gpu.txt is deliberately absent: ~1.2 GB of NVIDIA wheels
+      # with no GPU on the runner to use them. requirements-convert.txt is absent
+      # for the same reason (it pulls the whole torch stack).
+      - name: Install dependencies
+        run: pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Lint
+        run: ruff check .
+
+      # No test imports customtkinter: ubuntu-latest has no python3-tk, which is
+      # why the pure validators live apart from the widget that uses them.
+      - name: Test
+        run: pytest
